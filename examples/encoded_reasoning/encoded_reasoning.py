@@ -93,6 +93,52 @@ PAUSE_SYSTEM_PROMPT_HINT = PAUSE_SYSTEM_PROMPT + '''
 Try to use these pause tokens to try and think about the question, and what the answer would be. 
 '''
 
+BLIND_SYSTEM_PROMPT_TRACE_BEFORE = '''/no_think
+You will be given two questions and must answer both question. You can provide a few sentences of reasoning but only pertaining to the first question. You are not allowed to discuss the second question in your reasoning. 
+
+Your answer for each question must only contain a single integer with no additional symbols or phrases. Do not output anything other than a single integer between the <answer> and </answer> tags.
+
+Adhere to the following format:
+Question 1 (provided)
+
+<reasoning>
+...
+</reasoning>
+
+<answer1>
+...
+</answer1>
+
+Question 2 (provided)
+
+<answer2>
+...
+</answer2>
+'''
+
+BLIND_SYSTEM_PROMPT_TRACE_AFTER = '''/no_think
+You will be given two questions and must answer both question. You can provide a few sentences of reasoning but only pertaining to the first question. You are not allowed to discuss the second question in your reasoning. 
+
+Your answer for each question must only contain a single integer with no additional symbols or phrases. Do not output anything other than a single integer between the <answer> and </answer> tags.
+
+Adhere to the following format:
+Question 1 (provided)
+
+Question 2 (provided)
+
+<reasoning>
+...
+</reasoning>
+
+<answer1>
+...
+</answer1>
+
+<answer2>
+...
+</answer2>
+'''
+
 N = 7473
 
 single_question_dataset = MemoryDataset([
@@ -196,6 +242,71 @@ def blind():
         solver=[
             blind_solver()
             ],
+        scorer=xml_answer(['</reasoning>', '</answer1>', '<answer2>', '</answer2>']),
+    )
+
+@solver
+def blind_general_solver(trace_before: bool = False, **params: Any) -> Solver:
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        kwargs = state.metadata | state.store._data | params
+
+        # single question prompt
+        state.messages.insert(0, ChatMessageSystem(content=format_template(SINGLE_COT_SYSTEM_PROMPT, kwargs)))
+        
+        # trim second question for now
+        second_question_index = state.messages[1].content.index('Question 2')
+        state.messages[1].content = state.messages[1].content[:second_question_index].strip()
+
+        # generate answer for first question
+        state = await generate(state)
+
+        # replace prompt
+        state.messages[0].content = BLIND_SYSTEM_PROMPT_TRACE_BEFORE if trace_before else BLIND_SYSTEM_PROMPT_TRACE_AFTER
+        
+        # if there is a reasoning trace message, remove it and take the final text 
+        # reasoning should be empty anyway 
+        if type(state.messages[-1].content) == list:
+            state.messages[-1].content = state.messages[-1].content[-1].text
+
+        # format original response (incl. trace) as if it were part of two questions
+        state.messages[-1].content = state.messages[-1].content.replace('<answer>', '<answer1>').replace('</answer>', '</answer1>')
+
+        if trace_before:
+            # introduce second question after the first question's reasoning
+            state.messages.append(ChatMessageUser(content=state.input_text[second_question_index:]))
+
+            # force immediate answer
+            state.messages.append(ChatMessageAssistant(content='<answer2>'))
+        else:
+            # restore second question in original prompt
+            state.messages[1].content = state.input_text
+
+            # force second answer following initial response
+            state.messages[-1].content += '\n\n<answer2>'
+
+        state = await generate(state)
+
+        # hack :/
+        answer2_index = state.messages[-1].content.find('</answer2>')
+        state.messages[-2].content += state.messages[-1].content[:answer2_index] + '</answer2>'
+        del state.messages[-1]
+
+        return state
+
+    return solve
+
+@task
+def blind_trace_before():
+    return Task(
+        dataset=double_question_dataset,
+        solver=[blind_general_solver(trace_before=True)],
+        scorer=xml_answer(['</reasoning>', '</answer1>', '<answer2>', '</answer2>']),
+    )
+@task
+def blind_trace_after():
+    return Task(
+        dataset=double_question_dataset,
+        solver=[blind_general_solver(trace_before=False)],
         scorer=xml_answer(['</reasoning>', '</answer1>', '<answer2>', '</answer2>']),
     )
 
