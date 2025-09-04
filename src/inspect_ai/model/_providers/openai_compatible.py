@@ -1,6 +1,8 @@
 import os
 from logging import getLogger
 from typing import Any
+import requests
+import json
 
 from openai import (
     APIStatusError,
@@ -149,10 +151,17 @@ class OpenAICompatibleAPI(ModelAPI):
         )
 
         try:
+            if "reasoning" in request:
+                url = "https://openrouter.ai/api/v1/chat/completions"
+                headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+                response = requests.post(url, headers=headers, data=json.dumps({k:v for k, v in request.items() if v != NOT_GIVEN}))
+                completion: ChatCompletion = ChatCompletion.model_validate_json(response.text)
+
             # generate completion and save response for model call
-            completion: ChatCompletion = await self.client.chat.completions.create(
-                **request
-            )
+            else:
+                completion: ChatCompletion = await self.client.chat.completions.create(
+                    **request
+                )
             response = completion.model_dump()
             self.on_response(response)
 
