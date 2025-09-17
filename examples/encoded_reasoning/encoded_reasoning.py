@@ -418,7 +418,7 @@ def paraphrase(trace):
     return json.loads(response.text)["choices"][0]["message"]["content"]
 
 @solver
-def double_blind_solver(trace_transform: str = 'none', k: int = 1, **params: Any) -> Solver:
+def double_blind_solver(q1_transform: str = '', q2_transform: str = 'delete', k: int = 1, **params: Any) -> Solver:
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         kwargs = state.metadata | state.store._data | params
 
@@ -444,26 +444,36 @@ def double_blind_solver(trace_transform: str = 'none', k: int = 1, **params: Any
         reasoning_1 = state.messages[-1].content.split('<reasoning1>')[-1].split('</reasoning1>')[0].strip()
         reasoning_2 = state.messages[-1].content.split('<reasoning2>')[-1].split('</reasoning2>')[0].strip()
 
-        # remove q2 trace and force to answer
-        state.messages[-1].content = state.messages[-1].content.replace(reasoning_2, '...')
+        # transform q2 trace and force to answer
+        q2_sentences = split_into_sentences(reasoning_2)
+        transformed_reasoning = reasoning_2
+        if q2_transform == 'delete':
+            transformed_reasoning = '...'
+        elif q2_transform == 'shuffle':
+            random.shuffle(q2_sentences)
+            transformed_reasoning = " ".join(q2_sentences)
+        elif q2_transform == 'last_k':
+            transformed_reasoning = " ".join(q2_sentences[:-k]) if k < len(q2_sentences) else str()
+
+        state.messages[-1].content = state.messages[-1].content.replace(reasoning_2, transformed_reasoning)
         state.messages[-1].content = state.messages[-1].content[:state.messages[-1].content.find('<answer2>')] + '<answer2>'
 
-        sentences = split_into_sentences(reasoning_1)
+        q1_sentences = split_into_sentences(reasoning_1)
         transformed_reasoning = reasoning_1 # same by default
 
-        if trace_transform == 'first_k':
-            transformed_reasoning = " ".join(sentences[:k])
-        elif trace_transform == 'last_k':
-            transformed_reasoning = " ".join(sentences[:-k]) if k < len(sentences) else str()
-        elif trace_transform == 'shuffle':
-            random.shuffle(sentences)
-            transformed_reasoning = " ".join(sentences)
-        elif trace_transform == 'random':
+        if q1_transform == 'first_k':
+            transformed_reasoning = " ".join(q1_sentences[:k])
+        elif q1_transform == 'last_k':
+            transformed_reasoning = " ".join(q1_sentences[:-k]) if k < len(q1_sentences) else str()
+        elif q1_transform == 'shuffle':
+            random.shuffle(q1_sentences)
+            transformed_reasoning = " ".join(q1_sentences)
+        elif q1_transform == 'random':
             transformed_reasoning = "".join(
                 random.choice(string.ascii_letters + string.digits + string.punctuation + " ")
                 for _ in range(len(reasoning_1))
             )
-        elif trace_transform == 'paraphrase':
+        elif q1_transform == 'paraphrase':
             transformed_reasoning = paraphrase(reasoning_1)
 
         state.messages[-1].content = state.messages[-1].content.replace(reasoning_1, transformed_reasoning)
@@ -494,7 +504,7 @@ def double_blind():
 def double_blind_first5():
     return Task(
         dataset=double_question_dataset,
-        solver=[double_blind_solver(trace_transform='first_k', k=5)],
+        solver=[double_blind_solver(q1_transform='first_k', k=5)],
         scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
     )
 
@@ -502,7 +512,7 @@ def double_blind_first5():
 def double_blind_last2():
     return Task(
         dataset=double_question_dataset,
-        solver=[double_blind_solver(trace_transform='last_k', k=2)],
+        solver=[double_blind_solver(q1_transform='last_k', k=2)],
         scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
     )
 
@@ -510,7 +520,7 @@ def double_blind_last2():
 def double_blind_shuffle():
     return Task(
         dataset=double_question_dataset,
-        solver=[double_blind_solver(trace_transform='shuffle')],
+        solver=[double_blind_solver(q1_transform='shuffle')],
         scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
     )
 
@@ -518,7 +528,7 @@ def double_blind_shuffle():
 def double_blind_random():
     return Task(
         dataset=double_question_dataset,
-        solver=[double_blind_solver(trace_transform='random')],
+        solver=[double_blind_solver(q1_transform='random')],
         scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
     )
 
@@ -526,6 +536,22 @@ def double_blind_random():
 def double_blind_paraphrase():
     return Task(
         dataset=double_question_dataset,
-        solver=[double_blind_solver(trace_transform='paraphrase')],
+        solver=[double_blind_solver(q1_transform='paraphrase')],
+        scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
+    )
+
+@task
+def double_blind_last1_2():
+    return Task(
+        dataset=double_question_dataset,
+        solver=[double_blind_solver(q2_transform='last_k', k=1)],
+        scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
+    )
+
+@task
+def double_blind_shuffle_2():
+    return Task(
+        dataset=double_question_dataset,
+        solver=[double_blind_solver(q2_transform='shuffle')],
         scorer=xml_answer(['</reasoning1>', '</reasoning2>', '</answer1>', '<answer2>', '</answer2>']),
     )
