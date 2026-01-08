@@ -1,0 +1,156 @@
+import string
+import requests
+import os
+import json
+import random
+
+from datasets import load_dataset
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+
+from inspect_ai.dataset import MemoryDataset, Sample
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_HEADERS = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+
+src_dataset = load_dataset('openai/gsm8k', 'main', split='train')
+chars = string.ascii_letters + string.digits + string.punctuation + " "
+
+def shorten(question, **kwargs):
+    response = requests.post(OPENROUTER_URL, headers=OPENROUTER_HEADERS, data=json.dumps({
+        "model": "openai/gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "You will be given a question. You need to rewrite the question concisely so that it is only half as long. Make sure the question still contains all relevant information needed to solve the question. Specifically, make sure all numbers remain in the question. Output only the rewritten, shortened question."},
+            {"role": "user", "content": question}
+        ],
+        "reasoning": {"max_tokens": 1024},
+    }))
+    if response.status_code != 200: return str()
+    return json.loads(response.text)["choices"][0]["message"]["content"]
+
+def lengthen(question, **kwargs):
+    try:
+        response = requests.post(OPENROUTER_URL, headers=OPENROUTER_HEADERS, data=json.dumps({
+            "model": "openai/gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You will be given a question. You need to rewrite the question verbosely so that it is twice as long. Make sure the question still contains all relevant information needed to solve the question. Specifically, make sure all numbers remain in the question. Output only the rewritten, lengthened question."},
+                {"role": "user", "content": question}
+            ],
+            "reasoning": {"max_tokens": 1024},
+        }))
+        if response.status_code != 200: return str()
+        return json.loads(response.text)["choices"][0]["message"]["content"]
+    except:
+        print('lengthen error')
+        return question
+
+def add_random_tokens(question, n_tokens, **kwargs):
+    random_tokens = "".join(random.choice(chars) for _ in range(n_tokens))
+    return question + "\n" + random_tokens
+
+def add_blank_tokens(question, n_tokens, **kwargs):
+    blank_tokens = " " * n_tokens
+    return question + "\n" + blank_tokens
+
+def replace_random_tokens(question, **kwargs):
+    n_tokens = kwargs.pop('n_tokens', len(question))
+    random_tokens = "".join(random.choice(chars) for _ in range(n_tokens))
+    return random_tokens
+
+def replace_blank_tokens(question, **kwargs):
+    n_tokens = kwargs.pop('n_tokens', len(question))
+    blank_tokens = " " * n_tokens
+    return blank_tokens
+
+question_transforms = {
+    'shorten': shorten,
+    'lengthen': lengthen,
+    'add_random': add_random_tokens,
+    'add_blank': add_blank_tokens,
+    'replace_random': replace_random_tokens,
+    'replace_blank': replace_blank_tokens,
+}
+
+def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_questions: bool = False, N: int = 5000, **task_kwargs):
+    random.seed(12345)
+    if task_name == 'gsm8k':
+        if two_questions:
+            examples1 = src_dataset.select([i%N for i in range(0, N*2, 2)])
+            examples2 = src_dataset.select([i%N for i in range(1, N*2, 2)])
+
+            questions1 = [example['question'] for example in examples1]
+            answers1 = [example['answer'].split('####')[-1].strip() for example in examples1]
+
+            questions2 = [example['question'] for example in examples2]
+            answers2 = [example['answer'].split('####')[-1].strip() for example in examples2]
+        else:
+            examples1 = src_dataset.select(range(0, N))
+            questions1 = [example['question'] for example in examples1]
+            answers1 = [example['answer'].split('####')[-1].strip() for example in examples1]
+    if task_name == 'addition':
+        n = task_kwargs.pop('n')
+
+        examples1 = []
+        for _ in range(N):
+            a = random.randint(10 ** (n-1), 5 * 10 ** (n-1) - 1)
+            b = random.randint(10 ** (n-1), 5 * 10 ** (n-1) - 1)
+            examples1.append({'question': f'What is {a}+{b}?', 'answer': str(a+b)})
+        questions1 = [example['question'] for example in examples1]
+        answers1 = [example['answer'] for example in examples1]
+
+        if two_questions:
+            examples2 = []
+            for _ in range(N):
+                a = random.randint(10 ** (n-1), 5 * 10 ** (n-1) - 1)
+                b = random.randint(10 ** (n-1), 5 * 10 ** (n-1) - 1)
+                examples2.append({'question': f'What is {a}+{b}?', 'answer': str(a+b)})
+            questions2 = [example['question'] for example in examples2]
+            answers2 = [example['answer'] for example in examples2]
+
+    if task_name == 'multiplication':
+        n = task_kwargs.pop('n')
+
+        examples1 = []
+        for _ in range(N):
+            a = random.randint(10 ** (n-1), 10 ** n - 1)
+            b = random.randint(10 ** (n-1), 10 ** n - 1)
+            examples1.append({'question': f'What is {a} times {b}?', 'answer': str(a*b)})
+        questions1 = [example['question'] for example in examples1]
+        answers1 = [example['answer'] for example in examples1]
+
+        if two_questions:
+            examples2 = []
+            for _ in range(N):
+                a = random.randint(10 ** (n-1), 10 ** n - 1)
+                b = random.randint(10 ** (n-1), 10 ** n - 1)
+                examples2.append({'question': f'What is {a} times {b}?', 'answer': str(a*b)})
+            questions2 = [example['question'] for example in examples2]
+            answers2 = [example['answer'] for example in examples2]
+
+    if q1_transform in question_transforms:
+        transform = question_transforms[q1_transform]
+        with ThreadPoolExecutor() as executor:
+            questions1 = list(tqdm(executor.map(lambda question: transform(question, **task_kwargs), questions1), total=len(questions1)))
+    
+    if two_questions and q2_transform in question_transforms:
+        transform = question_transforms[q2_transform]
+        with ThreadPoolExecutor() as executor:
+            questions2 = list(tqdm(executor.map(lambda question: transform(question, **task_kwargs), questions2), total=len(questions2)))
+
+    if two_questions:
+        return MemoryDataset([
+            Sample(
+                input=f'''Question 1:\n{question1}\n\nQuestion 2:\n{question2}''',
+                target=answer2,
+            )
+            for question1, answer1, question2, answer2 in zip(questions1, answers1, questions2, answers2)
+        ])
+    else:
+        return MemoryDataset([
+            Sample(
+                input=question,
+                target=answer,
+            )
+            for question, answer in zip(questions1, answers1)
+        ])
