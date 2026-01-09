@@ -2,22 +2,8 @@ from inspect_ai import Task, task
 
 from inspect_ai.dataset import MemoryDataset, Sample
 from inspect_ai.solver import generate, system_message, TaskState
-from inspect_ai.scorer import (
-    CORRECT, INCORRECT, NOANSWER, Score, Target,
-    mean, stderr,
-    Scorer, scorer
-)
 
-import random
 import os
-
-def is_integer(s: str) -> bool:
-    """Check if a string represents any integer (positive, negative, or zero)."""
-    try:
-        int(s)
-        return True
-    except ValueError:
-        return False
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -30,57 +16,11 @@ PAUSE_SYSTEM_PROMPT, PAUSE_SYSTEM_PROMPT_FIXED, PAUSE_SYSTEM_PROMPT_HINT, \
 BLIND_SYSTEM_PROMPT_TRACE_BEFORE, BLIND_SYSTEM_PROMPT_TRACE_AFTER, \
 ENCODED_SYSTEM_PROMPT_HINT_2, ZERO_SHOT_SYSTEM_PROMPT_RG
 
-from examples.encoded_reasoning.dataset import custom_dataset
+from examples.encoded_reasoning.dataset import custom_dataset, add_fewshot_examples
 
 from examples.encoded_reasoning.solvers import blind_solver, double_zero_solver, blind_general_solver, double_blind_solver
 
-
-@scorer(metrics=[mean(), stderr()])
-def xml_answer(delimiters) -> Scorer:
-    """Scorer which produces an exact match score
-
-    Normalizes the text of the answer and target(s) and performs an exact matching comparison of the text. This scorer will return `CORRECT` when the answer is an exact match to one or more targets.
-    """
-
-    async def score(state: TaskState, target: Target) -> Score:
-        # Get generated answer and extract relevant answer text
-        answer = state.output.completion
-        targets = target.target
-
-        parsed_answer = answer
-
-        for delimiter in delimiters[:-1]:
-            parsed_answer = parsed_answer.split(delimiter)[-1]
-        parsed_answer = parsed_answer.split(delimiters[-1])[0].strip()
-
-        return Score(
-            value=NOANSWER if not is_integer(parsed_answer) or len(answer.split(delimiters[0])[0].strip()) > 1
-            else CORRECT if parsed_answer == targets[0]
-            else INCORRECT,
-            answer=answer
-        )
-
-    return score
-
-# only works for single question
-@scorer(metrics=[mean(), stderr()])
-def direct_answer() -> Scorer:
-
-    async def score(state: TaskState, target: Target) -> Score:
-        # Get generated answer and extract relevant answer text
-        answer = state.output.completion
-        targets = target.target
-
-        parsed_answer = answer.split('\n')[0].split('Answer:')[-1].strip()
-
-        return Score(
-            value=NOANSWER if not is_integer(parsed_answer)
-            else CORRECT if parsed_answer == targets[0]
-            else INCORRECT,
-            answer=answer
-        )
-
-    return score
+from examples.encoded_reasoning.scorers import xml_answer, direct_answer
 
 @task
 def zero_shot(task_name: str = "gsm8k", q1_transform: str = "none", N: int = 100, **task_kwargs):
@@ -111,6 +51,49 @@ def zero_shot_rg(task_name: str = "gsm8k", q1_transform: str = "none", N: int = 
     )
 
 @task
+def few_shot_rg(
+    task_name: str = "gsm8k",
+    q1_transform: str = "none",
+    N: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        q1_transform: Transform for question 1
+        N: Number of samples to evaluate
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform=q1_transform,
+        q2_transform=None,
+        two_questions=False,
+        N=N + num_fewshot,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[-num_fewshot:]
+    ]
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples, answer_format="Answer: {answer}"),
+        solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
+        scorer=direct_answer(),
+    )
+
+@task
 def filler(task_name: str = "gsm8k", N: int = 100, filler_tokens: int = 100, **task_kwargs):
     return Task(
         dataset=custom_dataset(task_name=task_name, q1_transform="add_numbers", 
@@ -124,6 +107,50 @@ def filler_rg(task_name: str = "gsm8k", N: int = 100, filler_tokens: int = 100, 
     return Task(
         dataset=custom_dataset(task_name=task_name, q1_transform="add_numbers", 
             q2_transform=None, two_questions=False, N=N, filler_tokens=filler_tokens, **task_kwargs),
+        solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG + f"\n\nAfter the problem, there will be filler tokens (counting from 1 to {filler_tokens}) to give you extra space to process the problem before answering."), generate()],
+        scorer=direct_answer(),
+    )
+
+@task
+def filler_fewshot_rg(
+    task_name: str = "gsm8k",
+    N: int = 100,
+    filler_tokens: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot filler evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        N: Number of samples to evaluate
+        filler_tokens: Number of filler tokens to add after each question
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform="add_numbers",
+        q2_transform=None,
+        two_questions=False,
+        N=N + num_fewshot,
+        filler_tokens=filler_tokens,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
+    ]
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples, answer_format="Answer: {answer}"),
         solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG + f"\n\nAfter the problem, there will be filler tokens (counting from 1 to {filler_tokens}) to give you extra space to process the problem before answering."), generate()],
         scorer=direct_answer(),
     )

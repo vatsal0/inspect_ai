@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 from inspect_ai.dataset import MemoryDataset, Sample
+from inspect_ai.model import ChatMessageUser, ChatMessageAssistant
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -186,3 +187,41 @@ def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_que
             )
             for question, answer in zip(questions1, answers1)
         ])
+
+def add_fewshot_examples(
+    dataset: MemoryDataset,
+    examples: list[tuple[str, str]],
+    answer_format: str = "Answer: {answer}",
+) -> MemoryDataset:
+    """Add few-shot examples to each sample in a dataset as user/assistant message pairs.
+
+    Args:
+        dataset: The original dataset
+        examples: List of (question, answer) tuples for few-shot demonstrations
+        answer_format: Format string for the assistant's answer (use {answer} as placeholder)
+
+    Returns:
+        New dataset with few-shot examples prepended to each sample's input
+    """
+    new_samples = []
+    for sample in dataset:
+        # Build few-shot messages
+        fewshot_messages = []
+        for q, a in examples:
+            fewshot_messages.append(ChatMessageUser(content=q))
+            fewshot_messages.append(ChatMessageAssistant(content=answer_format.format(answer=a)))
+
+        # Add the actual question
+        if isinstance(sample.input, str):
+            fewshot_messages.append(ChatMessageUser(content=sample.input))
+        else:
+            fewshot_messages.extend(sample.input)
+
+        new_samples.append(Sample(
+            input=fewshot_messages,
+            target=sample.target,
+            id=sample.id,
+            metadata=sample.metadata,
+        ))
+
+    return MemoryDataset(new_samples, name=dataset.name)
