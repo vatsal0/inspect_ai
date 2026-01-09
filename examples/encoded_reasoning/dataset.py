@@ -17,6 +17,14 @@ OPENROUTER_HEADERS = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-
 src_dataset = load_dataset('openai/gsm8k', 'main', split='train')
 chars = string.ascii_letters + string.digits + string.punctuation + " "
 
+# Load arithmetic dataset from JSONL file
+def load_arithmetic_dataset():
+    arithmetic_path = "/nas/ucb/vatsalb/no_cot_math_public/arithmetic_problems.jsonl"
+    with open(arithmetic_path, 'r') as f:
+        return [json.loads(line) for line in f]
+
+arithmetic_dataset = load_arithmetic_dataset()
+
 def shorten(question, **kwargs):
     response = requests.post(OPENROUTER_URL, headers=OPENROUTER_HEADERS, data=json.dumps({
         "model": "openai/gpt-4o-mini",
@@ -63,6 +71,11 @@ def replace_blank_tokens(question, **kwargs):
     blank_tokens = " " * n_tokens
     return blank_tokens
 
+def add_number_tokens(question, **kwargs):
+    filler_tokens = kwargs.pop('filler_tokens', 50)
+    filler = " ".join(str(i) for i in range(1, filler_tokens + 1))
+    return question + "\n" + filler
+
 question_transforms = {
     'shorten': shorten,
     'lengthen': lengthen,
@@ -70,6 +83,7 @@ question_transforms = {
     'add_blank': add_blank_tokens,
     'replace_random': replace_random_tokens,
     'replace_blank': replace_blank_tokens,
+    'add_numbers': add_number_tokens,
 }
 
 def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_questions: bool = False, N: int = 5000, **task_kwargs):
@@ -127,6 +141,24 @@ def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_que
                 examples2.append({'question': f'What is {a} times {b}?', 'answer': str(a*b)})
             questions2 = [example['question'] for example in examples2]
             answers2 = [example['answer'] for example in examples2]
+
+    if task_name == 'arithmetic':
+        if two_questions:
+            separator = 2
+            indices1 = [i % len(arithmetic_dataset) for i in range(0, N * 2, separator)]
+            indices2 = [i % len(arithmetic_dataset) for i in range(1, N * 2, separator)]
+
+            questions1 = [arithmetic_dataset[i]['problem'] for i in indices1]
+            answers1 = [str(arithmetic_dataset[i]['answer']) for i in indices1]
+
+            questions2 = [arithmetic_dataset[i]['problem'] for i in indices2]
+            answers2 = [str(arithmetic_dataset[i]['answer']) for i in indices2]
+        else:
+            separator = 1
+            indices1 = [i % len(arithmetic_dataset) for i in range(0, N, separator)]
+
+            questions1 = [arithmetic_dataset[i]['problem'] for i in indices1]
+            answers1 = [str(arithmetic_dataset[i]['answer']) for i in indices1]
 
     if q1_transform in question_transforms:
         transform = question_transforms[q1_transform]
