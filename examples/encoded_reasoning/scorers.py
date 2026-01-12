@@ -1,4 +1,5 @@
 import math
+import re
 
 from inspect_ai.solver import TaskState
 
@@ -108,6 +109,59 @@ def direct_answer() -> Scorer:
         parsed_answer = answer.split('\n')[0].split('Answer:')[-1].strip()
 
         is_noanswer = not is_integer(parsed_answer)
+        is_correct = not is_noanswer and parsed_answer == targets[0]
+
+        return Score(
+            value=NOANSWER if is_noanswer else CORRECT if is_correct else INCORRECT,
+            answer=answer,
+            metadata={"result_type": "noanswer" if is_noanswer else "correct" if is_correct else "incorrect"}
+        )
+
+    return score
+
+# only works for single question
+@scorer(metrics=[mean(), stderr(), mean_excluding_noanswer(), stderr_excluding_noanswer(), noanswer_rate()])
+def direct_answer_pause() -> Scorer:
+
+    async def score(state: TaskState, target: Target) -> Score:
+        # Get generated answer and extract relevant answer text
+        answer = state.output.completion
+        targets = target.target
+
+        parsed_answer = answer.split('pause')[-1].strip().split('\n')[0].split('Answer:')[-1].strip()
+
+        is_noanswer = not is_integer(parsed_answer)
+        is_correct = not is_noanswer and parsed_answer == targets[0]
+
+        return Score(
+            value=NOANSWER if is_noanswer else CORRECT if is_correct else INCORRECT,
+            answer=answer,
+            metadata={"result_type": "noanswer" if is_noanswer else "correct" if is_correct else "incorrect"}
+        )
+
+    return score
+
+# only works for single question
+# Expects format: any number of positive integers separated by spaces, then "Answer:" followed by an integer
+@scorer(metrics=[mean(), stderr(), mean_excluding_noanswer(), stderr_excluding_noanswer(), noanswer_rate()])
+def direct_answer_numbers() -> Scorer:
+
+    async def score(state: TaskState, target: Target) -> Score:
+        answer = state.output.completion
+        targets = target.target
+
+        # Pattern: optional (integers separated by spaces), then "Answer:" and an integer
+        # ^(\d+\s+)*Answer:\s*(-?\d+)\s*$
+        pattern = r'^(\d+\s+)*Answer:\s*(\d+)\s*$'
+        match = re.match(pattern, answer.strip())
+
+        if match:
+            parsed_answer = match.group(2)
+            is_noanswer = False
+        else:
+            parsed_answer = None
+            is_noanswer = True
+
         is_correct = not is_noanswer and parsed_answer == targets[0]
 
         return Score(

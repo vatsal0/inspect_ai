@@ -15,6 +15,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_HEADERS = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
 
+LOREM_IPSUM_WORDS = """lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum""".split()
+
 src_dataset = load_dataset('openai/gsm8k', 'main', split='train')
 chars = string.ascii_letters + string.digits + string.punctuation + " "
 
@@ -77,6 +79,26 @@ def add_number_tokens(question, **kwargs):
     filler = " ".join(str(i) for i in range(1, filler_tokens + 1))
     return question + "\n" + filler
 
+def add_ellipses(question, **kwargs):
+    filler_tokens = kwargs.pop('filler_tokens', 50)
+    filler = " ".join('...' for i in range(1, filler_tokens + 1))
+    return question + "\n" + filler
+
+def add_pause_tokens(question, **kwargs):
+    filler_tokens = kwargs.pop('filler_tokens', 50)
+    filler = " ".join('pause' for i in range(1, filler_tokens + 1))
+    return question + "\n" + filler
+
+def add_pause_tokens_before(question, **kwargs):
+    filler_tokens = kwargs.pop('filler_tokens', 50)
+    filler = " ".join('pause' for i in range(1, filler_tokens + 1))
+    return filler + "\n" + question
+
+def add_lorem_ipsum_tokens(question, **kwargs):
+    filler_tokens = kwargs.pop('filler_tokens', 50)
+    filler = " ".join(LOREM_IPSUM_WORDS[(i - 1) % len(LOREM_IPSUM_WORDS)] for i in range(1, filler_tokens + 1))
+    return question + "\n" + filler
+
 question_transforms = {
     'shorten': shorten,
     'lengthen': lengthen,
@@ -85,6 +107,9 @@ question_transforms = {
     'replace_random': replace_random_tokens,
     'replace_blank': replace_blank_tokens,
     'add_numbers': add_number_tokens,
+    'add_ellipses': add_ellipses,
+    'add_pause': add_pause_tokens,
+    'add_lorem_ipsum': add_lorem_ipsum_tokens,
 }
 
 def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_questions: bool = False, N: int = 5000, **task_kwargs):
