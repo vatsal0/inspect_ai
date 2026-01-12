@@ -6,8 +6,13 @@ from pydantic import BaseModel, Field
 from typing_extensions import override
 
 from inspect_ai._util._async import current_async_backend
-from inspect_ai._util.constants import DEFAULT_MAX_TOKENS
-from inspect_ai._util.content import Content, ContentImage, ContentText
+from inspect_ai._util.constants import DEFAULT_MAX_TOKENS, NO_CONTENT
+from inspect_ai._util.content import (
+    Content,
+    ContentImage,
+    ContentReasoning,
+    ContentText,
+)
 from inspect_ai._util.error import PrerequisiteError, pip_dependency_error
 from inspect_ai._util.images import file_as_data
 from inspect_ai._util.version import verify_required_version
@@ -49,6 +54,11 @@ ConverseStopReason = Literal[
     "stop_sequence",
     "guardrail_intervened",
     "content_filtered",
+    "malformed_model_output",
+    "malformed_tool_use",
+    "invalid_query",
+    "max_tool_invocations",
+    "model_context_window_exceeded",
 ]
 ConverseGuardContentQualifier = Literal["grounding_source", "query", "guard_content"]
 ConverseFilterType = Literal[
@@ -107,6 +117,14 @@ class ConverseGuardContent(BaseModel):
     text: ConverseGuardContentText
 
 
+class ConverseReasoningText(BaseModel):
+    text: str
+
+
+class ConverseReasoningContent(BaseModel):
+    reasoningText: ConverseReasoningText
+
+
 class ConverseMessageContent(BaseModel):
     text: str | None = None
     image: ConverseImage | None = None
@@ -114,6 +132,7 @@ class ConverseMessageContent(BaseModel):
     toolUse: ConverseToolUse | None = None
     toolResult: ConverseToolResult | None = None
     guardContent: ConverseGuardContent | None = None
+    reasoningContent: ConverseReasoningContent | None = None
 
 
 class ConverseMessage(BaseModel):
@@ -317,6 +336,60 @@ class BedrockAPI(ModelAPI):
     def collapse_assistant_messages(self) -> bool:
         return True
 
+    @override
+    def canonical_name(self) -> str:
+        """Canonical model name for model info database lookup.
+
+        Bedrock model names use the format: provider.model-name-version:variant
+        e.g., anthropic.claude-3-5-sonnet-20241022-v2:0
+
+        Returns the canonical format: provider/model-name
+        e.g., anthropic/claude-3-5-sonnet-20241022
+        """
+        name = self.model_name
+        provider: str | None = None
+
+        # Extract provider prefix (e.g., "anthropic." or "meta.")
+        if "." in name:
+            provider, name = name.split(".", 1)
+
+        # Strip variant suffix (e.g., ":0")
+        if ":" in name:
+            name = name.split(":")[0]
+
+        # Strip version suffix like -v1, -v2
+        if name.endswith(("-v1", "-v2", "-v3")):
+            name = name[:-3]
+
+        # Return with provider prefix for database lookup
+        return f"{provider}/{name}" if provider else name
+
+    @override
+    def emulate_reasoning_history(self) -> bool:
+        # claude needs reasoning history emulation because the reasoning signature doesn't
+        # make it all the way through the converse api (so when we try to replay it there is
+        # an error from claude indicating the signature was missing)
+        return self.is_claude()
+
+    @override
+    def is_auth_failure(self, ex: Exception) -> bool:
+        from botocore.exceptions import ClientError
+
+        if isinstance(ex, ClientError):
+            error_code = ex.response.get("Error", {}).get("Code", "")
+            return error_code in [
+                "UnrecognizedClientException",
+                "ExpiredTokenException",
+                "InvalidSignatureException",
+            ]
+        return False
+
+    def is_gpt_oss(self) -> bool:
+        return "gpt-oss" in self.model_name
+
+    def is_claude(self) -> bool:
+        return "claude" in self.model_name
+
     async def generate(
         self,
         input: list[ChatMessage],
@@ -350,6 +423,14 @@ class BedrockAPI(ModelAPI):
             # Resolve the input messages into converse messages
             system, messages = await converse_messages(input)
 
+            # additional model request fields
+            additionalModelRequestFields: dict[str, Any] = {}
+            if config.top_k:
+                additionalModelRequestFields["top_k"] = config.top_k
+            additionalModelRequestFields = (
+                additionalModelRequestFields | self.reasoning_config(config)
+            )
+
             # Make the request
             request = ConverseClientConverseRequest(
                 modelId=self.model_name,
@@ -361,10 +442,7 @@ class BedrockAPI(ModelAPI):
                     topP=config.top_p,
                     stopSequences=config.stop_seqs,
                 ),
-                additionalModelRequestFields={
-                    "top_k": config.top_k,
-                    **config.model_config,
-                },
+                additionalModelRequestFields=additionalModelRequestFields,
                 toolConfig=tool_config,
             )
 
@@ -387,8 +465,8 @@ class BedrockAPI(ModelAPI):
             except ClientError as ex:
                 # Look for an explicit validation exception
                 if ex.response["Error"]["Code"] == "ValidationException":
-                    response = ex.response["Error"]["Message"]
-                    if "too many input tokens" in response.lower():
+                    response = ex.response["Error"]["Message"].lower()
+                    if "too many input tokens" in response or "is too long" in response:
                         return ModelOutput.from_content(
                             model=self.model_name,
                             content=response,
@@ -404,6 +482,21 @@ class BedrockAPI(ModelAPI):
 
         # return
         return output, model_call(response)
+
+    def reasoning_config(self, config: GenerateConfig) -> dict[str, Any]:
+        if self.is_gpt_oss():
+            if config.reasoning_effort is not None:
+                return {"reasoning_effort": config.reasoning_effort}
+        elif self.is_claude():
+            if config.reasoning_tokens is not None:
+                return {
+                    "reasoning_config": {
+                        "type": "enabled",
+                        "budget_tokens": config.reasoning_tokens,
+                    }
+                }
+
+        return {}
 
 
 async def converse_messages(
@@ -453,6 +546,10 @@ def model_output_from_response(
                     arguments=cast(dict[str, Any], c.toolUse.input or {}),
                 )
             )
+        elif c.reasoningContent is not None:
+            # Handle reasoning content
+            reasoning_text = c.reasoningContent.reasoningText.text
+            content.append(ContentReasoning(reasoning=reasoning_text))
         else:
             raise ValueError("Unexpected message response in Bedrock provider")
 
@@ -497,6 +594,16 @@ def message_stop_reason(
             return "content_filter"
         case "guardrail_intervened":
             return "content_filter"
+        case "model_context_window_exceeded":
+            return "model_length"
+        # these are basically server errors which we don't have a way to encode right now
+        case (
+            "malformed_model_output"
+            | "malformed_tool_use"
+            | "invalid_query"
+            | "max_tool_invocations"
+        ):
+            return "unknown"
         case _:
             return "unknown"
 
@@ -629,8 +736,22 @@ async def converse_contents(
                 )
             elif c.type == "text":
                 result.append(ConverseMessageContent(text=c.text))
+            elif c.type == "reasoning":
+                result.append(
+                    ConverseMessageContent(
+                        reasoningContent=ConverseReasoningContent(
+                            reasoningText=ConverseReasoningText(text=c.reasoning)
+                        )
+                    )
+                )
             else:
                 raise RuntimeError(f"Unsupported content type {c.type}")
+
+        # if result is empty converse will reject the api call so insert
+        # a dummy 'no content' as required
+        if len(result) == 0:
+            result = [ConverseMessageContent(text=NO_CONTENT)]
+
         return result
 
 

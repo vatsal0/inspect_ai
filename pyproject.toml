@@ -6,11 +6,23 @@ build-backend = "setuptools.build_meta"
 dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools_scm]
+git_describe_command = [
+  'git',
+  'describe',
+  '--dirty',
+  '--tags',
+  '--long',
+  '--match',
+  '[0-9]*.[0-9]*.[0-9]*',
+]
 
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["inspect_ai*"]
+
+[tool.setuptools.package-data]
+inspect_ai = ["binaries/*", "tool/sandbox_tools/sandbox_tools_version.txt"]
 
 
 [tool.ruff]
@@ -26,9 +38,9 @@ select = [
   "I",      # isort
   "B",      # flake8-bugbear
   "SIM101", # duplicate isinstance
-  "UP038",  # non-pep604-isinstance
   # "RET", # flake8-return
   # "RUF", # ruff rules
+  "DTZ",
 ]
 ignore = [
   "E203",
@@ -65,7 +77,7 @@ norecursedirs = [
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-log_level = "warning"
+log_level = "WARNING"
 
 [tool.mypy]
 exclude = [
@@ -73,7 +85,9 @@ exclude = [
   "build",
   "(?:^|/)_resources/",
   "examples/bridge",
+  "examples/hooks",
   "src/inspect_tool_support",
+  "src/inspect_sandbox_tools",
 ]
 warn_unused_ignores = true
 no_implicit_reexport = true
@@ -137,20 +151,23 @@ inspect = "inspect_ai._cli.main:main"
 
 [project.optional-dependencies]
 dev = [
-  "anthropic>=0.52.0",
-  "aioboto3",
+  "adlfs>=2025.8.0",
+  "anthropic>=0.62.0",
+  "azure-identity",
   "azure-ai-inference",
-  "google-cloud-aiplatform",
+  "fastapi",
   "google-genai",
   "griffe",
   "groq",
+  "huggingface_hub>=1.0.0",
+  "inspect_scout",
   "ipython",
   "jsonpath-ng",
   "markdown",
   "mcp>=1.10.0",
   "mistralai",
   "moto[server]",
-  "mypy>=1.16.0",
+  "mypy>=1.17.0",
   "nbformat",
   "openai",
   "pandas>=2.0.0",
@@ -166,11 +183,13 @@ dev = [
   "pytest-mock",
   "pytest-watcher",
   "pytest-xdist",
-  "ruff==0.9.6",             # match version specified in .pre-commit-config.yaml
+  "ruff==0.9.6",           # match version specified in .pre-commit-config.yaml
+  "together",
   "textual-dev>=0.86.2",
   "trio",
   "pandas-stubs",
   "pyarrow-stubs",
+  "types-grpcio",
   "types-Markdown",
   "types-PyYAML",
   "types-beautifulsoup4",
@@ -182,9 +201,18 @@ dev = [
   "types-protobuf",
   "types-psutil",
   "types-python-dateutil",
+  "xai_sdk",
+  "uvicorn",
 ]
 dev-mcp-tests = ["mcp-server-fetch", "mcp_server_git"]
-doc = ["quarto-cli==1.5.57", "jupyter", "panflute", "markdown", "griffe"]
+doc = [
+  "quarto-cli==1.7.32",
+  "jupyter",
+  "panflute",
+  "markdown",
+  "griffe",
+  "click>=8.2.0",
+]
 dist = ["twine", "build"]
 
 [tool.typos.default.extend-words]

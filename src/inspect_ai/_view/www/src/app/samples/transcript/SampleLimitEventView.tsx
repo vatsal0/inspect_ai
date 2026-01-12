@@ -1,6 +1,7 @@
 import clsx from "clsx";
 import { FC } from "react";
-import { SampleLimitEvent, Type15 } from "../../../@types/log";
+import { SampleLimitEvent, Type17 } from "../../../@types/log";
+import { formatDateTime } from "../../../utils/format";
 import { ApplicationIcons } from "../../appearance/icons";
 import { EventPanel } from "./event/EventPanel";
 import { EventNode } from "./types";
@@ -17,7 +18,7 @@ export const SampleLimitEventView: FC<SampleLimitEventViewProps> = ({
   eventNode,
   className,
 }) => {
-  const resolve_title = (type: Type15) => {
+  const resolve_title = (type: Type17) => {
     switch (type) {
       case "custom":
         return "Custom Limit Exceeded";
@@ -34,7 +35,7 @@ export const SampleLimitEventView: FC<SampleLimitEventViewProps> = ({
     }
   };
 
-  const resolve_icon = (type: Type15) => {
+  const resolve_icon = (type: Type17) => {
     switch (type) {
       case "custom":
         return ApplicationIcons.limits.custom;
@@ -59,6 +60,7 @@ export const SampleLimitEventView: FC<SampleLimitEventViewProps> = ({
       eventNodeId={eventNode.id}
       depth={eventNode.depth}
       title={title}
+      subTitle={formatDateTime(new Date(eventNode.event.timestamp))}
       icon={icon}
       className={className}
     >

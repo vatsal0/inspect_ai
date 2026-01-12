@@ -82,14 +82,20 @@ class GroqAPI(ModelAPI):
         if not self.api_key:
             raise environment_prerequisite_error("Groq", GROQ_API_KEY)
 
-        self.client = AsyncGroq(
+        self.model_args = model_args
+        self.initialize()
+
+    def _create_client(self) -> AsyncGroq:
+        return AsyncGroq(
             api_key=self.api_key,
-            base_url=model_base_url(base_url, "GROQ_BASE_URL"),
-            **model_args,
+            base_url=model_base_url(self.base_url, "GROQ_BASE_URL"),
+            **self.model_args,
             http_client=httpx.AsyncClient(limits=httpx.Limits(max_connections=None)),
         )
 
-        # create time tracker
+    def initialize(self) -> None:
+        super().initialize()
+        self.client = self._create_client()
         self._http_hooks = HttpxHooks(self.client._client)
 
     @override
@@ -202,6 +208,20 @@ class GroqAPI(ModelAPI):
             params["seed"] = config.seed
         if config.num_choices is not None:
             params["n"] = config.num_choices
+        if config.reasoning_effort is not None:
+            params["reasoning_effort"] = config.reasoning_effort
+        if config.response_schema is not None:
+            params["response_format"] = dict(
+                type="json_schema",
+                json_schema=dict(
+                    name=config.response_schema.name,
+                    schema=config.response_schema.json_schema.model_dump(
+                        exclude_none=True
+                    ),
+                    description=config.response_schema.description,
+                    strict=config.response_schema.strict,
+                ),
+            )
         return params
 
     def _chat_choices_from_response(
@@ -231,12 +251,27 @@ class GroqAPI(ModelAPI):
         return str(self.api_key)
 
     @override
+    def is_auth_failure(self, ex: Exception) -> bool:
+        if isinstance(ex, APIStatusError):
+            return ex.status_code == 401
+        return False
+
+    @override
     def collapse_user_messages(self) -> bool:
         return False
 
     @override
     def collapse_assistant_messages(self) -> bool:
         return False
+
+    @override
+    def canonical_name(self) -> str:
+        """Canonical model name for model info database lookup.
+
+        Groq model names don't map directly to HuggingFace format.
+        Return the raw model name and rely on fuzzy matching in get_model_info().
+        """
+        return self.model_name
 
     @override
     def max_tokens(self) -> Optional[int]:
@@ -254,7 +289,7 @@ class GroqAPI(ModelAPI):
                 content = str(error.get("message", content))
                 code = error.get("code", code)
 
-            if code == "context_length_exceeded":
+            if code == "context_length_exceeded" or "reduce the length" in content:
                 return ModelOutput.from_content(
                     model=self.model_name,
                     content=content,

@@ -1,7 +1,8 @@
 from logging import getLogger
-from typing import Literal, Sequence, cast
+from typing import Literal, Sequence
 
 from inspect_ai._util._async import is_callable_coroutine
+from inspect_ai._util.content import Content, ContentText
 from inspect_ai.model._call_tools import execute_tools
 from inspect_ai.model._chat_message import (
     ChatMessage,
@@ -9,6 +10,13 @@ from inspect_ai.model._chat_message import (
     ChatMessageSystem,
     ChatMessageTool,
     ChatMessageUser,
+)
+from inspect_ai.model._compaction import (
+    Compact,
+    CompactionStrategy,
+)
+from inspect_ai.model._compaction import (
+    compaction as create_compaction,
 )
 from inspect_ai.model._model import Model, get_model
 from inspect_ai.model._trim import trim_messages
@@ -18,7 +26,7 @@ from inspect_ai.tool._tool import Tool, ToolResult, ToolSource, tool
 from inspect_ai.tool._tool_def import ToolDef
 from inspect_ai.tool._tool_info import parse_tool_info
 
-from ._agent import Agent, AgentState, agent, agent_with
+from ._agent import Agent, AgentState, agent, agent_with, is_agent
 from ._filter import MessageFilter
 from ._handoff import has_handoff
 from ._types import (
@@ -44,6 +52,8 @@ def react(
     attempts: int | AgentAttempts = 1,
     submit: AgentSubmit | bool | None = None,
     on_continue: str | AgentContinue | None = None,
+    retry_refusals: int | None = None,
+    compaction: CompactionStrategy | None = None,
     truncation: Literal["auto", "disabled"] | MessageFilter = "disabled",
 ) -> Agent:
     """Extensible ReAct agent based on the paper [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629).
@@ -84,6 +94,9 @@ def react(
           to play back. Note that this function is called on _every_ iteration of
           the loop so if you only want to send a message back when the model fails
           to call tools you need to code that behavior explicitly.
+       retry_refusals: Should refusals be retried? (pass number of times to retry)
+       compaction: Compact the conversation when it it is close to overflowing
+          the model's context window. See [Compaction](https://inspect.aisi.org.uk/compaction.html) for details on compaction strategies.
        truncation: Truncate the conversation history in the event of a context
           window overflow. Defaults to "disabled" which does no truncation. Pass
           "auto" to use `trim_messages()` to reduce the context size. Pass a
@@ -109,6 +122,8 @@ def react(
             tools=tools,
             model=model,
             on_continue=on_continue,
+            retry_refusals=retry_refusals,
+            compaction=compaction,
             truncation=truncation,
         )
 
@@ -133,10 +148,14 @@ def react(
     tools = list(tools) if tools is not None else []
 
     # resolve submit tool
-    submit_tool = ToolDef(
-        submit.tool or default_submit_tool(),
-        name=submit.name,
-        description=submit.description,
+    submit_tool = (
+        ToolDef(
+            submit.tool or default_submit_tool(),
+            name=submit.name,
+            description=submit.description,
+        )
+        if not isinstance(submit.tool, ToolDef)
+        else submit.tool
     )
     tools.append(submit_tool)
 
@@ -153,6 +172,8 @@ def react(
                 for result in tool_results
                 if isinstance(result, ChatMessageTool)
                 and result.function == submit_tool.name
+                # Require that the submit tool call has no error
+                and result.error is None
             ),
             None,
         )
@@ -166,6 +187,9 @@ def react(
             # resolve overflow handling
             overflow = _resolve_overflow(truncation)
 
+            # create compact function
+            compact = _agent_compact(compaction, state.messages, tools, model)
+
             # track attempts
             attempt_count = 0
 
@@ -173,7 +197,9 @@ def react(
             # or if a message or token limit is hit
             while True:
                 # generate output and append assistant message
-                state = await _agent_generate(model, state, tools)
+                state = await _agent_generate(
+                    model, state, tools, retry_refusals, compact
+                )
 
                 # check for context window overflow
                 if state.output.stop_reason == "model_length":
@@ -199,6 +225,17 @@ def react(
                             state.output.completion = answer
                         else:
                             state.output.completion = f"{state.output.completion}{submit.answer_delimiter}{answer}".strip()
+
+                        # also populate the message text (as the submit tool will be removed)
+                        if (
+                            not submit.keep_in_messages
+                            and len(state.output.choices) > 0
+                        ):
+                            message = state.output.choices[0].message
+                            if isinstance(message.content, str):
+                                message.content = f"{message.content}{submit.answer_delimiter}{answer}".strip()
+                            else:
+                                message.content.append(ContentText(text=answer))
 
                         # exit if we are at max_attempts
                         attempt_count += 1
@@ -251,6 +288,9 @@ def react(
                                 content=do_continue.format(submit=submit_tool.name)
                             )
                         )
+                    elif isinstance(do_continue, AgentState):
+                        state.messages = do_continue.messages
+                        state.output = do_continue.output
                     else:  # do_continue is False
                         break
 
@@ -285,6 +325,8 @@ def react_no_submit(
     tools: Sequence[Tool | ToolDef | ToolSource] | None,
     model: str | Model | Agent | None,
     on_continue: AgentContinue | None,
+    retry_refusals: int | None,
+    compaction: CompactionStrategy | None,
     truncation: Literal["auto", "disabled"] | MessageFilter,
 ) -> Agent:
     # resolve tools
@@ -302,10 +344,15 @@ def react_no_submit(
             # resolve overflow handling
             overflow = _resolve_overflow(truncation)
 
+            # create compact function
+            compact = _agent_compact(compaction, state.messages, tools, model)
+
             # main loop
             while True:
                 # generate output and append assistant message
-                state = await _agent_generate(model, state, tools)
+                state = await _agent_generate(
+                    model, state, tools, retry_refusals, compact
+                )
 
                 # check for context window overflow
                 if state.output.stop_reason == "model_length":
@@ -335,6 +382,9 @@ def react_no_submit(
                             )
                     elif isinstance(do_continue, str):
                         state.messages.append(ChatMessageUser(content=do_continue))
+                    elif isinstance(do_continue, AgentState):
+                        state.messages = do_continue.messages
+                        state.output = do_continue.output
                     else:
                         break
                 elif not state.output.message.tool_calls:
@@ -381,7 +431,7 @@ def _resolve_overflow(
 ) -> MessageFilter | None:
     # resolve overflow handling
     if truncation == "auto":
-        overflow = cast(MessageFilter | None, trim_messages)
+        overflow: MessageFilter | None = trim_messages
     elif truncation == "disabled":
         overflow = None
     else:
@@ -408,14 +458,40 @@ async def _handle_overflow(
     return state, False
 
 
+def _agent_compact(
+    compaction: CompactionStrategy | None,
+    prefix: list[ChatMessage],
+    tools: Sequence[Tool | ToolDef | ToolSource] | None,
+    model: str | Model | Agent | None,
+) -> Compact | None:
+    # create compact function
+    if compaction is not None:
+        return create_compaction(
+            strategy=compaction,
+            prefix=prefix,
+            tools=tools,
+            model=model if isinstance(model, str | Model | None) else None,
+        )
+    else:
+        return None
+
+
 async def _agent_generate(
     model: str | Model | Agent | None,
     state: AgentState,
     tools: Sequence[Tool | ToolDef | ToolSource],
+    retry_refusals: int | None,
+    compact: Compact | None,
 ) -> AgentState:
+    # warn if we try to combine compaction with a custom agent
+    if is_agent(model) and compact is not None:
+        logger.warning(
+            "react() agent: compaction has been enabled along with a custom agent as the model. Ignoring compaction strategy (the agent needs to handle compaction directly)."
+        )
+
     # convert model to agent
     if isinstance(model, str | Model) or model is None:
-        model = _model_generate(model)
+        model = _model_generate(model, retry_refusals, compact)
 
     # resolve tools
     resolved_tools: list[Tool] = []
@@ -438,10 +514,35 @@ async def _agent_generate(
     return await model(state, resolved_tools)
 
 
-def _model_generate(model: str | Model | None) -> Agent:
+def _model_generate(
+    model: str | Model | None,
+    retry_refusals: int | None,
+    compact: Compact | None,
+) -> Agent:
     async def generate(state: AgentState, tools: list[Tool]) -> AgentState:
-        state.output = await get_model(model).generate(state.messages, tools)
-        state.messages.append(state.output.message)
+        # optionally perform compaction on the input
+        if compact is not None:
+            input_messages, c_message = await compact(state.messages)
+            if c_message is not None:
+                state.messages.append(c_message)
+        else:
+            input_messages = state.messages
+
+        attempts = 0
+        while True:
+            # generate
+            output = await get_model(model).generate(input_messages, tools)
+
+            # if it's a refusal see if we should retry
+            if output.stop_reason == "content_filter":
+                if retry_refusals is not None and attempts < retry_refusals:
+                    attempts += 1
+                    continue
+
+            # no retry, we are done
+            state.output = output
+            state.messages.append(state.output.message)
+            break
         return state
 
     return generate
@@ -449,7 +550,7 @@ def _model_generate(model: str | Model | None) -> Agent:
 
 async def _call_on_continue(
     on_continue: AgentContinue, state: AgentState
-) -> str | bool:
+) -> str | bool | AgentState:
     if not is_callable_coroutine(on_continue):
         raise ValueError("The on_continue function must be async.")
     return await on_continue(state)
@@ -481,25 +582,24 @@ def _remove_submit_tool(
 
             # If a submit tool call was removed, we need to update the message
             if len(new_tools_calls) < len(message.tool_calls):
+                # Some models (OpenAI) don't like to see the reasoning
+                # content item that led to the submit tool call, so we
+                # remove the last reasoning item
+                new_content: str | list[Content] = message.content
+                if isinstance(new_content, list):
+                    new_content = new_content.copy()
+                    indices = [
+                        i for i, x in enumerate(new_content) if x.type == "reasoning"
+                    ]
+                    if indices:
+                        new_content.pop(indices[-1])
+
+                # update w/ new tool calls and new content
                 message = message.model_copy(
                     update=dict(
                         tool_calls=new_tools_calls,
-                        # Some models (OpenAI) don't like to see the reasoning
-                        # content item that led to the submit tool call, so we
-                        # have to remove it too.
-                        content=(
-                            [
-                                content
-                                for content in message.content
-                                if (
-                                    isinstance(content, str)
-                                    or content.type != "reasoning"
-                                )
-                            ]
-                            if isinstance(message.content, list)
-                            else message.content
-                        ),
-                    )
+                        content=new_content,
+                    ),
                 )
 
         # always append message

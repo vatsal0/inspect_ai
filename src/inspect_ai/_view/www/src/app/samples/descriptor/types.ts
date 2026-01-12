@@ -32,6 +32,7 @@ export interface ScoreDescriptor {
   categories?: Array<Object>;
   min?: number;
   max?: number;
+  filterable?: boolean;
   compare: (a: SelectedScore, b: SelectedScore) => number;
   render: (score: Value2) => ReactNode;
 }
@@ -53,5 +54,5 @@ export interface MessageShapeData {
   answer: number;
   limit: number;
   retries: number;
-  score: number;
+  scores: number[];
 }

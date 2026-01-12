@@ -1,13 +1,24 @@
 import clsx from "clsx";
-import { FC, RefObject, useCallback, useMemo } from "react";
+import {
+  CSSProperties,
+  FC,
+  RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+} from "react";
 import { RenderedEventNode } from "./TranscriptVirtualList";
 import { EventNode } from "./types";
 
+import { VirtuosoHandle } from "react-virtuoso";
 import { LiveVirtualList } from "../../../components/LiveVirtualList";
+import { useStore } from "../../../state/store";
 import styles from "./TranscriptVirtualListComponent.module.css";
 
 interface TranscriptVirtualListComponentProps {
   id: string;
+  listHandle: RefObject<VirtuosoHandle | null>;
   eventNodes: EventNode[];
   initialEventId?: string | null;
   offsetTop?: number;
@@ -23,6 +34,7 @@ export const TranscriptVirtualListComponent: FC<
   TranscriptVirtualListComponentProps
 > = ({
   id,
+  listHandle,
   eventNodes,
   scrollRef,
   running,
@@ -30,6 +42,12 @@ export const TranscriptVirtualListComponent: FC<
   offsetTop,
   className,
 }) => {
+  const useVirtualization = running || eventNodes.length > 100;
+  const setNativeFind = useStore((state) => state.appActions.setNativeFind);
+  useEffect(() => {
+    setNativeFind(!useVirtualization);
+  }, [setNativeFind, useVirtualization]);
+
   const initialEventIndex = useMemo(() => {
     if (initialEventId === null || initialEventId === undefined) {
       return undefined;
@@ -40,8 +58,42 @@ export const TranscriptVirtualListComponent: FC<
     return result === -1 ? undefined : result;
   }, [initialEventId, eventNodes]);
 
+  const hasToolEventsAtCurrentDepth = useCallback(
+    (startIndex: number) => {
+      // Walk backwards from this index to see if we see any tool events
+      // at this depth, prior to this event
+      for (let i = startIndex; i >= 0; i--) {
+        const node = eventNodes[i];
+        if (node.event.event === "tool") {
+          return true;
+        }
+        if (node.depth < eventNodes[startIndex].depth) {
+          return false;
+        }
+      }
+      return false;
+    },
+    [eventNodes],
+  );
+
+  const contextWithToolEvents = useMemo(() => ({ hasToolEvents: true }), []);
+  const contextWithoutToolEvents = useMemo(
+    () => ({ hasToolEvents: false }),
+    [],
+  );
+
+  const nonVirtualGridRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!useVirtualization && initialEventId) {
+      const row = nonVirtualGridRef.current?.querySelector(
+        `[id="${initialEventId}"]`,
+      );
+      row?.scrollIntoView({ block: "start" });
+    }
+  }, [initialEventId, useVirtualization]);
+
   const renderRow = useCallback(
-    (index: number, item: EventNode) => {
+    (index: number, item: EventNode, style?: CSSProperties) => {
       const paddingClass = index === 0 ? styles.first : undefined;
 
       const previousIndex = index - 1;
@@ -64,36 +116,63 @@ export const TranscriptVirtualListComponent: FC<
         ? styles.attachedParent
         : undefined;
 
+      const hasToolEvents = hasToolEventsAtCurrentDepth(index);
+      const context = hasToolEvents
+        ? contextWithToolEvents
+        : contextWithoutToolEvents;
+
       return (
         <div
           id={item.id}
           key={item.id}
           className={clsx(styles.node, paddingClass, attachedClass)}
           style={{
+            ...style,
             paddingLeft: `${item.depth <= 1 ? item.depth * 0.7 : (0.7 + item.depth - 1) * 1}em`,
             paddingRight: `${item.depth === 0 ? undefined : ".7em"} `,
           }}
         >
           <RenderedEventNode
             node={item}
+            next={next}
             className={clsx(attachedParentClass, attachedChildClass)}
+            context={context}
           />
         </div>
       );
     },
-    [eventNodes],
+    [
+      eventNodes,
+      hasToolEventsAtCurrentDepth,
+      contextWithToolEvents,
+      contextWithoutToolEvents,
+    ],
   );
 
-  return (
-    <LiveVirtualList<EventNode>
-      className={className}
-      id={id}
-      scrollRef={scrollRef}
-      data={eventNodes}
-      initialTopMostItemIndex={initialEventIndex}
-      offsetTop={offsetTop}
-      renderRow={renderRow}
-      live={running}
-    />
-  );
+  if (useVirtualization) {
+    return (
+      <LiveVirtualList<EventNode>
+        listHandle={listHandle}
+        className={className}
+        id={id}
+        scrollRef={scrollRef}
+        data={eventNodes}
+        initialTopMostItemIndex={initialEventIndex}
+        offsetTop={offsetTop}
+        renderRow={renderRow}
+        live={running}
+      />
+    );
+  } else {
+    return (
+      <div ref={nonVirtualGridRef}>
+        {eventNodes.map((node, index) => {
+          const row = renderRow(index, node, {
+            scrollMarginTop: offsetTop,
+          });
+          return row;
+        })}
+      </div>
+    );
+  }
 };

@@ -1,15 +1,28 @@
 import json
-from typing import Sequence, TypedDict, cast
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import reduce
+from typing import Any, Iterable, Protocol, Sequence, TypeGuard, cast
 
 from openai.types.responses import (
+    ComputerToolParam,
+    CustomToolParam,
+    EasyInputMessageParam,
     FunctionToolParam,
+    ResponseCodeInterpreterToolCall,
+    ResponseCodeInterpreterToolCallParam,
     ResponseComputerToolCall,
     ResponseComputerToolCallParam,
+    ResponseCustomToolCall,
+    ResponseCustomToolCallOutputParam,
+    ResponseCustomToolCallParam,
+    ResponseFunctionCallOutputItemListParam,
     ResponseFunctionToolCall,
     ResponseFunctionToolCallParam,
     ResponseFunctionWebSearch,
     ResponseFunctionWebSearchParam,
     ResponseInputContentParam,
+    ResponseInputFileParam,
     ResponseInputImageParam,
     ResponseInputItemParam,
     ResponseInputMessageContentListParam,
@@ -21,39 +34,113 @@ from openai.types.responses import (
     ResponseOutputTextParam,
     ResponseReasoningItem,
     ResponseReasoningItemParam,
+    ResponseUsage,
     ToolChoiceFunctionParam,
+    ToolChoiceMcpParam,
     ToolChoiceTypesParam,
     ToolParam,
+    WebSearchToolParam,
 )
 from openai.types.responses import Response as OpenAIResponse
 from openai.types.responses.response import IncompleteDetails
-from openai.types.responses.response_create_params import (
-    ToolChoice as ResponsesToolChoice,
+from openai.types.responses.response_code_interpreter_tool_call import (
+    OutputImage,
+    OutputLogs,
 )
-from openai.types.responses.response_input_item_param import FunctionCallOutput, Message
+from openai.types.responses.response_code_interpreter_tool_call_param import (
+    OutputLogs as OutputLogsParam,
+)
+from openai.types.responses.response_create_params import (
+    ToolChoice as ResponsesToolChoiceParam,
+)
+from openai.types.responses.response_custom_tool_call_output_param import (
+    OutputOutputContentList,
+)
+from openai.types.responses.response_function_web_search_param import (
+    Action,
+    ActionSearch,
+)
+from openai.types.responses.response_input_image_content_param import (
+    ResponseInputImageContentParam,
+)
+from openai.types.responses.response_input_item_param import (
+    ComputerCallOutput,
+    FunctionCallOutput,
+    Message,
+)
+from openai.types.responses.response_input_item_param import McpCall as McpCallParam
+from openai.types.responses.response_input_item_param import (
+    McpListTools as McpListToolsParam,
+)
+from openai.types.responses.response_input_item_param import (
+    McpListToolsTool as McpListToolsToolParam,
+)
+from openai.types.responses.response_input_text_content_param import (
+    ResponseInputTextContentParam,
+)
+from openai.types.responses.response_output_item import (
+    McpCall,
+    McpListTools,
+)
+from openai.types.responses.response_output_message_param import (
+    Content as OutputContent,
+)
 from openai.types.responses.response_output_text import (
     Annotation,
     AnnotationFileCitation,
     AnnotationFilePath,
     AnnotationURLCitation,
 )
-from openai.types.responses.response_reasoning_item_param import Summary
-from pydantic import JsonValue
+from openai.types.responses.response_output_text import (
+    Logprob as LogprobResponses,
+)
+from openai.types.responses.response_output_text_param import (
+    Annotation as AnnotationParam,
+)
+from openai.types.responses.response_reasoning_item_param import Content as ContentParam
+from openai.types.responses.response_reasoning_item_param import Summary as SummaryParam
+from openai.types.responses.response_usage import (
+    InputTokensDetails,
+    OutputTokensDetails,
+)
+from openai.types.responses.tool_param import (
+    CodeInterpreter,
+    CodeInterpreterContainerCodeInterpreterToolAuto,
+    Mcp,
+)
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from inspect_ai._util.citation import Citation, DocumentCitation, UrlCitation
 from inspect_ai._util.content import (
     Content,
+    ContentAudio,
+    ContentDocument,
     ContentImage,
     ContentReasoning,
     ContentText,
+    ContentToolUse,
+    ContentVideo,
 )
 from inspect_ai._util.images import file_as_data_uri
+from inspect_ai._util.json import to_json_str_safe
 from inspect_ai._util.url import is_http_url
 from inspect_ai.model._call_tools import parse_tool_call
-from inspect_ai.model._chat_message import ChatMessage, ChatMessageAssistant
+from inspect_ai.model._chat_message import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageTool,
+)
 from inspect_ai.model._generate_config import GenerateConfig
-from inspect_ai.model._model_output import ChatCompletionChoice, StopReason
-from inspect_ai.model._openai import is_o_series
+from inspect_ai.model._model_output import (
+    ChatCompletionChoice,
+    Logprob,
+    Logprobs,
+    ModelUsage,
+    StopReason,
+    TopLogprob,
+)
+from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
+from inspect_ai.tool._mcp._remote import is_mcp_server_tool
 from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.tool._tool_choice import ToolChoice
 from inspect_ai.tool._tool_info import ToolInfo
@@ -65,27 +152,41 @@ from ._providers._openai_computer_use import (
 )
 from ._providers._openai_web_search import maybe_web_search_tool
 
+MESSAGE_ID = "message_id"
+
+
+class ResponsesModelInfo(Protocol):
+    def has_reasoning_options(self) -> bool: ...
+    def is_gpt(self) -> bool: ...
+    def is_gpt_5(self) -> bool: ...
+    def is_gpt_5_plus(self) -> bool: ...
+    def is_gpt_5_pro(self) -> bool: ...
+    def is_gpt_5_chat(self) -> bool: ...
+    def is_o_series(self) -> bool: ...
+    def is_o1(self) -> bool: ...
+    def is_o1_early(self) -> bool: ...
+    def is_o3_mini(self) -> bool: ...
+    def is_deep_research(self) -> bool: ...
+    def is_computer_use_preview(self) -> bool: ...
+    def is_codex(self) -> bool: ...
+
 
 async def openai_responses_inputs(
-    messages: list[ChatMessage], model: str
+    messages: list[ChatMessage], model_info: ResponsesModelInfo | None = None
 ) -> list[ResponseInputItemParam]:
     return [
         item
         for message in messages
-        for item in await _openai_input_item_from_chat_message(message, model)
+        for item in await _openai_input_item_from_chat_message(message, model_info)
     ]
 
 
 async def _openai_input_item_from_chat_message(
-    message: ChatMessage, model: str
+    message: ChatMessage, model_info: ResponsesModelInfo | None = None
 ) -> list[ResponseInputItemParam]:
     if message.role == "system":
         content = await _openai_responses_content_list_param(message.content)
-        return (
-            [Message(type="message", role="developer", content=content)]
-            if is_o_series(model)
-            else [Message(type="message", role="system", content=content)]
-        )
+        return [Message(type="message", role="developer", content=content)]
     elif message.role == "user":
         return [
             Message(
@@ -95,25 +196,101 @@ async def _openai_input_item_from_chat_message(
             )
         ]
     elif message.role == "assistant":
-        return _openai_input_items_from_chat_message_assistant(message)
+        return _openai_input_items_from_chat_message_assistant(message, model_info)
     elif message.role == "tool":
-        if message.internal:
-            internal = _model_tool_call_for_internal(message.internal)
-            if internal.type == "computer_call":
-                return [computer_call_output(message, internal)]
-
-        return [
-            FunctionCallOutput(
-                type="function_call_output",
-                call_id=message.tool_call_id or str(message.function),
-                output=message.error.message
-                if message.error is not None
-                else message.text,
-            )
-        ]
+        # see if we need to recover the call id for the computer tool calls
+        responses_tool_call = assistant_internal().tool_calls.get(
+            message.tool_call_id or str(message.function)
+        )
+        if (
+            responses_tool_call is not None
+            and responses_tool_call["type"] == "computer_call"
+        ):
+            return [
+                computer_call_output(
+                    message,
+                    responses_tool_call["call_id"],
+                    responses_tool_call.get("pending_safety_checks"),
+                )
+            ]
+        elif (
+            responses_tool_call is not None
+            and responses_tool_call["type"] == "custom_tool_call"
+        ):
+            return [
+                ResponseCustomToolCallOutputParam(
+                    type="custom_tool_call_output",
+                    call_id=message.tool_call_id or str(message.function),
+                    output=message.error.message
+                    if message.error is not None
+                    else await _openai_responses_custom_tool_call_output(message),
+                )
+            ]
+        else:
+            return [
+                FunctionCallOutput(
+                    type="function_call_output",
+                    call_id=message.tool_call_id or str(message.function),
+                    output=message.error.message
+                    if message.error is not None
+                    else await _openai_responses_function_call_output(message),
+                )
+            ]
 
     else:
         raise ValueError(f"Unexpected message role '{message.role}'")
+
+
+async def _openai_responses_function_call_output(
+    message: ChatMessageTool,
+) -> str | ResponseFunctionCallOutputItemListParam:
+    if isinstance(message.content, str):
+        return message.content
+    else:
+        outputs: ResponseFunctionCallOutputItemListParam = []
+        for c in message.content:
+            if isinstance(c, ContentText):
+                outputs.append(
+                    ResponseInputTextContentParam(type="input_text", text=c.text)
+                )
+            elif isinstance(c, ContentImage):
+                outputs.append(
+                    ResponseInputImageContentParam(
+                        type="input_image",
+                        detail=c.detail,
+                        image_url=(
+                            c.image
+                            if is_http_url(c.image)
+                            else await file_as_data_uri(c.image)
+                        ),
+                    )
+                )
+        return outputs
+
+
+async def _openai_responses_custom_tool_call_output(
+    message: ChatMessageTool,
+) -> str | Iterable[OutputOutputContentList]:
+    if isinstance(message.content, str):
+        return message.content
+    else:
+        outputs: list[OutputOutputContentList] = []
+        for c in message.content:
+            if isinstance(c, ContentText):
+                outputs.append(ResponseInputTextParam(type="input_text", text=c.text))
+            elif isinstance(c, ContentImage):
+                outputs.append(
+                    ResponseInputImageParam(
+                        type="input_image",
+                        detail=c.detail,
+                        image_url=(
+                            c.image
+                            if is_http_url(c.image)
+                            else await file_as_data_uri(c.image)
+                        ),
+                    )
+                )
+        return outputs
 
 
 async def _openai_responses_content_list_param(
@@ -140,21 +317,46 @@ async def _openai_responses_content_param(
                 else await file_as_data_uri(content.image)
             ),
         )
+    elif isinstance(content, ContentAudio | ContentVideo | ContentDocument):
+        match content:
+            case ContentAudio():
+                contents = content.audio
+                filename = f"audio.{content.format}"
+            case ContentVideo():
+                contents = content.video
+                filename = f"video.{content.format}"
+            case ContentDocument():
+                contents = content.document
+                filename = content.filename
+            case _:
+                raise TypeError(f"Unexpected content type: {type(content)}")
+
+        file_data_uri = await file_as_data_uri(contents)
+
+        return ResponseInputFileParam(
+            type="input_file", file_data=file_data_uri, filename=filename
+        )
     else:
-        # TODO: support for files (PDFs) and audio and video whenever
-        # that is supported by the responses API (was not on initial release)
-
-        # TODO: note that when doing this we should ensure that the
-        # openai_media_filter is properly screening out base64 encoded
-        # audio and video (if it exists, looks like it may all be done
-        # w/ file uploads in the responses API)
-
         raise ValueError("Unsupported content type.")
+
+
+def responses_extra_body_fields() -> list[str]:
+    return [
+        "service_tier",
+        "max_tool_calls",
+        "metadata",
+        "previous_response_id",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "truncation",
+        "store",
+    ]
 
 
 def openai_responses_tool_choice(
     tool_choice: ToolChoice, tools: list[ToolParam]
-) -> ResponsesToolChoice:
+) -> ResponsesToolChoiceParam:
     match tool_choice:
         case "none" | "auto":
             return tool_choice
@@ -165,6 +367,9 @@ def openai_responses_tool_choice(
                 ToolChoiceTypesParam(type="computer_use_preview")
                 if tool_choice.name == "computer"
                 and any(tool["type"] == "computer_use_preview" for tool in tools)
+                else ToolChoiceTypesParam(type="web_search_preview")
+                if tool_choice.name == "web_search"
+                and any(tool["type"] == "web_search" for tool in tools)
                 else ToolChoiceFunctionParam(type="function", name=tool_choice.name)
             )
 
@@ -176,12 +381,17 @@ def openai_responses_tools(
 
 
 def openai_responses_chat_choices(
-    model: str, response: OpenAIResponse, tools: list[ToolInfo]
+    model: str | None, response: OpenAIResponse, tools: list[ToolInfo]
 ) -> list[ChatCompletionChoice]:
-    message, stop_reason = _chat_message_assistant_from_openai_response(
+    model = model or response.model
+    message, stop_reason, logprobs = _chat_message_assistant_from_openai_response(
         model, response, tools
     )
-    return [ChatCompletionChoice(message=message, stop_reason=stop_reason)]
+    return [
+        ChatCompletionChoice(
+            message=message, stop_reason=stop_reason, logprobs=logprobs
+        )
+    ]
 
 
 def is_native_tool_configured(
@@ -224,13 +434,85 @@ def is_native_tool_configured(
 #                                  └───────────────────────────┘
 
 
-class _AssistantInternal(TypedDict):
-    tool_message_ids: dict[str, str]
+@dataclass
+class _AssistantInternal:
+    tool_calls: dict[
+        str,
+        ResponseFunctionToolCallParam
+        | ResponseCustomToolCallParam
+        | ResponseComputerToolCallParam
+        | ResponseFunctionWebSearchParam
+        | ResponseCodeInterpreterToolCallParam,
+    ] = field(default_factory=dict)
+    server_tool_uses: dict[str, ResponseInputItemParam] = field(default_factory=dict)
+
+
+def assistant_internal() -> _AssistantInternal:
+    return _openai_assistant_internal.get()
+
+
+def init_sample_openai_assistant_internal() -> None:
+    _openai_assistant_internal.set(_AssistantInternal())
+
+
+_openai_assistant_internal: ContextVar[_AssistantInternal] = ContextVar(
+    "opanai_assistant_internal", default=_AssistantInternal()
+)
+
+
+def content_from_response_input_content_param(
+    input: ResponseInputContentParam,
+) -> Content:
+    if is_input_text(input):
+        return ContentText(text=input["text"])
+    elif is_input_image(input):
+        return ContentImage(
+            image=input.get("image_url", "") or "", detail=input.get("detail", "auto")
+        )
+    elif is_input_file(input):
+        return ContentDocument(document=input["file_data"], filename=input["filename"])
+    else:
+        raise RuntimeError(f"Unexpected input from responses API: {input}")
+
+
+def is_tool_choice_function_param(
+    tool_choice: ResponsesToolChoiceParam,
+) -> TypeGuard[ToolChoiceFunctionParam]:
+    if not isinstance(tool_choice, str):
+        return tool_choice.get("type") == "function"
+    else:
+        return False
+
+
+def is_tool_choice_mcp_param(
+    tool_choice: ResponsesToolChoiceParam,
+) -> TypeGuard[ToolChoiceMcpParam]:
+    if not isinstance(tool_choice, str):
+        return tool_choice.get("type") == "mcp"
+    else:
+        return False
+
+
+def responses_model_usage(usage: ModelUsage | None) -> ResponseUsage | None:
+    if usage is not None:
+        return ResponseUsage(
+            input_tokens=usage.input_tokens,
+            input_tokens_details=InputTokensDetails(
+                cached_tokens=usage.input_tokens_cache_read or 0
+            ),
+            output_tokens=usage.output_tokens,
+            output_tokens_details=OutputTokensDetails(
+                reasoning_tokens=usage.reasoning_tokens or 0
+            ),
+            total_tokens=usage.total_tokens,
+        )
+    else:
+        return None
 
 
 def _chat_message_assistant_from_openai_response(
     model: str, response: OpenAIResponse, tools: list[ToolInfo]
-) -> tuple[ChatMessageAssistant, StopReason]:
+) -> tuple[ChatMessageAssistant, StopReason, Logprobs | None]:
     """
     Transform OpenAI `Response` into an Inspect `ChatMessageAssistant` and `StopReason`.
 
@@ -252,20 +534,34 @@ def _chat_message_assistant_from_openai_response(
             stop_reason = "stop"
 
     # collect output and tool calls
+    logprobs: Logprobs | None = None
     message_content: list[Content] = []
     tool_calls: list[ToolCall] = []
-    internal = _AssistantInternal(tool_message_ids={})
     for output in response.output:
         match output:
             case ResponseOutputMessage(content=content, id=id):
+                # find logprobs in content if available
+                logprobs_content = next(
+                    (
+                        c
+                        for c in content
+                        if isinstance(c, ResponseOutputText) and c.logprobs is not None
+                    ),
+                    None,
+                )
+                if logprobs_content is not None:
+                    logprobs = _logprobs_from_responses_logprobs(
+                        logprobs_content.logprobs
+                    )
+
                 message_content.extend(
                     [
                         ContentText(
                             text=c.text,
-                            internal={"id": id},
+                            internal={MESSAGE_ID: id},
                             citations=(
                                 [
-                                    _to_inspect_citation(annotation)
+                                    to_inspect_citation(annotation)
                                     for annotation in c.annotations
                                 ]
                                 if c.annotations
@@ -274,62 +570,266 @@ def _chat_message_assistant_from_openai_response(
                         )
                         if isinstance(c, ResponseOutputText)
                         else ContentText(
-                            text=c.refusal, refusal=True, internal={"id": id}
+                            text=c.refusal, refusal=True, internal={MESSAGE_ID: id}
                         )
                         for c in content
                     ]
                 )
-            case ResponseReasoningItem(summary=summary, id=id):
-                message_content.append(
-                    ContentReasoning(
-                        reasoning="\n".join([s.text for s in summary]), signature=id
+            case ResponseReasoningItem():
+                message_content.append(reasoning_from_responses_reasoning(output))
+
+            case ResponseFunctionToolCall():
+                stop_reason = "tool_calls"
+                if output.id is not None:
+                    assistant_internal().tool_calls[output.call_id] = cast(
+                        ResponseFunctionToolCallParam, output.model_dump()
+                    )
+
+                tool_calls.append(
+                    parse_tool_call(
+                        output.call_id,
+                        _from_responses_tool_alias(output.name),
+                        output.arguments,
+                        tools,
                     )
                 )
-            case _:
+            case ResponseCustomToolCall():
                 stop_reason = "tool_calls"
-                match output:
-                    case ResponseFunctionToolCall():
-                        if output.id is not None:
-                            internal["tool_message_ids"][output.call_id] = output.id
-                        tool_calls.append(
-                            parse_tool_call(
-                                output.call_id,
-                                _from_responses_tool_alias(output.name),
-                                output.arguments,
-                                tools,
-                            )
+                if output.id is not None:
+                    assistant_internal().tool_calls[output.call_id] = cast(
+                        ResponseCustomToolCallParam, output.model_dump()
+                    )
+                tool_call = ToolCall(
+                    id=output.call_id,
+                    function=output.name,
+                    arguments={"input": output.input},
+                    type="custom",
+                )
+                tool_calls.append(tool_call)
+
+            case ResponseComputerToolCall():
+                stop_reason = "tool_calls"
+                if output.id is not None:
+                    assistant_internal().tool_calls[output.call_id] = cast(
+                        ResponseComputerToolCallParam, output.model_dump()
+                    )
+
+                if output.pending_safety_checks:
+                    from inspect_ai.log._transcript import transcript
+
+                    for check in output.pending_safety_checks:
+                        transcript().info(
+                            f"Safety check acknowledged: {check.code or 'unknown code'} - {check.message or 'unknown message'}"
                         )
-                    case ResponseComputerToolCall():
-                        if output.id is not None:
-                            internal["tool_message_ids"][output.call_id] = output.id
-                        tool_calls.append(
-                            tool_call_from_openai_computer_tool_call(output)
-                        )
-                    case ResponseFunctionWebSearch():
-                        # We don't currently capture this since the model did the
-                        # "tool call" internally. It's conceivable that could be
-                        # forced to include it in `.internal` in the future, but
-                        # for now we just ignore it.
-                        # {"id":"ws_682cdcec3fa88198bc10b38fafefbd5e077e89e31fd4a3d5","status":"completed","type":"web_search_call"}
-                        pass
-                    case _:
-                        raise ValueError(f"Unexpected output type: {output.__class__}")
+
+                tool_calls.append(tool_call_from_openai_computer_tool_call(output))
+
+            case ResponseFunctionWebSearch():
+                assistant_internal().server_tool_uses[output.id] = cast(
+                    ResponseFunctionWebSearchParam, output.model_dump(exclude_none=True)
+                )
+                message_content.append(web_search_to_tool_use(output))
+            case ResponseCodeInterpreterToolCall():
+                message_content.append(code_interpreter_to_tool_use(output))
+            case McpListTools():
+                assistant_internal().server_tool_uses[output.id] = cast(
+                    McpListToolsParam, output.model_dump()
+                )
+                message_content.append(mcp_list_tools_to_tool_use(output))
+            case McpCall():
+                assistant_internal().server_tool_uses[output.id] = cast(
+                    McpCallParam, output.model_dump()
+                )
+                message_content.append(mcp_call_to_tool_use(output))
+            case _:
+                raise ValueError(f"Unexpected output type: {output.__class__}")
 
     return (
         ChatMessageAssistant(
-            id=response.id,
             content=message_content,
-            internal=cast(JsonValue, internal),
             tool_calls=tool_calls if len(tool_calls) > 0 else None,
             model=model,
             source="generate",
         ),
         stop_reason,
+        logprobs,
+    )
+
+
+def _logprobs_from_responses_logprobs(
+    logprobs: list[LogprobResponses] | None,
+) -> Logprobs | None:
+    if logprobs is not None and len(logprobs) > 0:
+        return Logprobs(
+            content=[
+                Logprob(
+                    token=lp.token,
+                    logprob=lp.logprob,
+                    bytes=lp.bytes,
+                    top_logprobs=[
+                        TopLogprob(
+                            token=tlp.token, logprob=tlp.logprob, bytes=tlp.bytes
+                        )
+                        for tlp in lp.top_logprobs
+                    ],
+                )
+                for lp in logprobs
+            ]
+        )
+    else:
+        return None
+
+
+def reasoning_from_responses_reasoning(
+    item: ResponseReasoningItem | ResponseReasoningItemParam,
+) -> ContentReasoning:
+    if not isinstance(item, ResponseReasoningItem):
+        item = read_reasoning_item_param(item)
+
+    if item.encrypted_content is not None:
+        reasoning = item.encrypted_content
+        redacted = True
+    else:
+        reasoning = (
+            "\n".join([s.text for s in item.content])
+            if item.content is not None
+            else ""
+        )
+        redacted = False
+
+    if item.summary:
+        summary: str | None = "\n\n".join([s.text for s in item.summary])
+    else:
+        summary = None
+
+    return ContentReasoning(
+        reasoning=reasoning, summary=summary, signature=item.id, redacted=redacted
+    )
+
+
+# two issues addressed here:
+#   - ResponseReasoningItem requires an 'id' but OpenAI doesn't return an 'id' when store=False
+#   - Some clients (e.g. codex cli) do not provide the id even when it has been passed back to them (this is likely b/c they know they are passing store=False)
+def read_reasoning_item_param(
+    param: ResponseReasoningItemParam,
+) -> ResponseReasoningItem:
+    no_id = param.get("id", None) is None
+    if no_id:
+        param = param.copy()
+        param["id"] = "dummy-id"
+    item = ResponseReasoningItem.model_validate(param)
+    if no_id:
+        item.id = None  # type: ignore[assignment]
+    return item
+
+
+def responses_reasoning_from_reasoning(
+    content: ContentReasoning,
+) -> ResponseReasoningItemParam:
+    content_params: list[ContentParam] = []
+    if content.redacted:
+        encrypted_content: str | None = content.reasoning
+    else:
+        encrypted_content = None
+        if content.reasoning:
+            content_params.append(
+                ContentParam(type="reasoning_text", text=content.reasoning)
+            )
+
+    summary_params: list[SummaryParam] = []
+    if content.summary:
+        summary_params.append(SummaryParam(type="summary_text", text=content.summary))
+
+    return ResponseReasoningItemParam(
+        type="reasoning",
+        # OpenAI returns 'None' when store=False even though the schema requires the id
+        id=content.signature,  # type: ignore[typeddict-item]
+        content=content_params,
+        summary=summary_params,
+        encrypted_content=encrypted_content,
+    )
+
+
+mcp_tool_adapter = TypeAdapter(list[McpListToolsToolParam])
+
+
+def web_search_to_tool_use(output: ResponseFunctionWebSearch) -> ContentToolUse:
+    return ContentToolUse(
+        tool_type="web_search",
+        id=output.id,
+        name=output.action.type,
+        arguments=output.action.to_json(exclude_none=True),
+        result="",
+        error="failed" if output.status == "failed" else None,
+    )
+
+
+def mcp_list_tools_to_tool_use(output: McpListTools) -> ContentToolUse:
+    return ContentToolUse(
+        tool_type="mcp_call",
+        id=output.id,
+        name="mcp_list_tools",
+        arguments="",
+        result=to_json_str_safe([tool.model_dump() for tool in output.tools]),
+        error=output.error,
+    )
+
+
+def mcp_call_to_tool_use(output: McpCall) -> ContentToolUse:
+    return ContentToolUse(
+        tool_type="mcp_call",
+        id=output.id,
+        name=output.name,
+        context=output.server_label,
+        arguments=output.arguments,
+        result=output.output or "",
+        error=output.error,
+    )
+
+
+def tool_use_to_mcp_list_tools_param(content: ContentToolUse) -> McpListToolsParam:
+    return McpListToolsParam(
+        type="mcp_list_tools",
+        id=content.id,
+        server_label=content.context or "",
+        tools=mcp_tool_adapter.validate_json(content.result),
+        error=content.error,
+    )
+
+
+def tool_use_to_mcp_call_param(content: ContentToolUse) -> McpCallParam:
+    return McpCallParam(
+        type="mcp_call",
+        id=content.id,
+        name=content.name,
+        arguments=content.arguments,
+        server_label=content.context or "",
+        output=content.result,
+        error=content.error,
+    )
+
+
+action_adapter = TypeAdapter[Action](Action)
+
+
+def tool_use_to_web_search_param(
+    content: ContentToolUse,
+) -> ResponseFunctionWebSearchParam:
+    try:
+        action = action_adapter.validate_json(content.arguments)
+    except ValidationError:
+        action = ActionSearch(type="search", query=content.arguments)
+
+    return ResponseFunctionWebSearchParam(
+        type="web_search_call",
+        id=content.id,
+        action=action,
+        status="failed" if content.error else "completed",
     )
 
 
 def _openai_input_items_from_chat_message_assistant(
-    message: ChatMessageAssistant,
+    message: ChatMessageAssistant, model_info: ResponsesModelInfo | None = None
 ) -> list[ResponseInputItemParam]:
     """
     Transform a `ChatMessageAssistant` into OpenAI `ResponseInputItem`'s for playback to the model.
@@ -339,90 +839,119 @@ def _openai_input_items_from_chat_message_assistant(
     field of the `ChatMessageAssistant` to help it provide the proper id's the
     items in the returned list.
     """
-    tool_message_ids = _ids_from_assistant_internal(message)
-
     # we want to prevent yielding output messages in the case where we have an
     # 'internal' field (so the message came from the model API as opposed to
     # being user synthesized) AND there are no ContentText items with message IDs
     # (indicating that when reading the message from the server we didn't find output).
     # this could happen e.g. when a react() agent sets the output.completion in response
     # to a submit() tool call
-    content_items: list[ContentText | ContentReasoning] = (
+    content_items: list[ContentText | ContentReasoning | ContentToolUse] = (
         [ContentText(text=message.content)]
         if isinstance(message.content, str)
         else [
-            c for c in message.content if isinstance(c, ContentText | ContentReasoning)
+            c
+            for c in message.content
+            if isinstance(c, ContentText | ContentReasoning | ContentToolUse)
         ]
     )
-    has_content_with_ids = any(
-        isinstance(c, ContentText)
-        and isinstance(c.internal, dict)
-        and "id" in c.internal
-        for c in content_items
-    )
-    suppress_output_message = message.internal is not None and not has_content_with_ids
 
     # items to return
     items: list[ResponseInputItemParam] = []
-    # group content by message ID
-    messages_by_id: dict[
-        str | None, list[ResponseOutputTextParam | ResponseOutputRefusalParam]
-    ] = {}
+    pending_response_output_id: str | None = None
+    pending_response_output: list[
+        ResponseOutputRefusalParam | ResponseOutputTextParam
+    ] = []
 
-    for content in _filter_consecutive_reasoning_blocks(content_items):
+    def flush_pending_context_text() -> None:
+        nonlocal pending_response_output_id
+        if len(pending_response_output) > 0:
+            items.append(
+                ResponseOutputMessageParam(
+                    type="message",
+                    role="assistant",
+                    # this actually can be `None`, and it will in fact be `None` when the
+                    # assistant message is synthesized by the scaffold as opposed to being
+                    # replayed from the model
+                    # Is it okay to dynamically generate this here? We need this in
+                    # order to read this back into the equivalent BaseModel for the bridge
+                    id=pending_response_output_id,  # type: ignore[typeddict-item]
+                    content=pending_response_output.copy(),
+                    status="completed",
+                )
+            )
+        pending_response_output_id = None
+        pending_response_output.clear()
+
+    # filter consecutive reasoning blocks if we have a model that demands it
+    if model_info is not None and model_info.is_o1_early():
+        content_items = _filter_consecutive_reasoning_blocks(content_items)
+
+    for content in content_items:
+        # flush if we aren't ContentText
+        if not isinstance(content, ContentText):
+            flush_pending_context_text()
+
         match content:
-            case ContentReasoning(reasoning=reasoning):
-                assert content.signature is not None, (
-                    "reasoning_id must be saved in signature"
-                )
-                items.append(
-                    ResponseReasoningItemParam(
-                        type="reasoning",
-                        id=content.signature,
-                        summary=[Summary(type="summary_text", text=reasoning)]
-                        if reasoning
-                        else [],
+            case ContentReasoning():
+                items.append(responses_reasoning_from_reasoning(content))
+            case ContentToolUse(
+                id=id,
+                tool_type=tool_type,
+            ):
+                if id in assistant_internal().server_tool_uses:
+                    items.append(assistant_internal().server_tool_uses[id])
+                elif tool_type == "mcp_call":
+                    if content.name == "mcp_list_tools":
+                        items.append(tool_use_to_mcp_list_tools_param(content))
+                    else:
+                        items.append(tool_use_to_mcp_call_param(content))
+                elif tool_type == "web_search":
+                    items.append(tool_use_to_web_search_param(content))
+                elif tool_type == "code_execution":
+                    # openai raises an error if we try to replay code_interpreter
+                    # message params when store=False so we just do it as text
+                    pending_response_output.append(
+                        ResponseOutputTextParam(
+                            type="output_text",
+                            text=f"code_interpreter: {content.arguments}\n\n{content.error or content.result}",
+                            annotations=[],
+                            logprobs=[],
+                        )
                     )
-                )
-            case ContentText(text=text, refusal=refusal):
-                if suppress_output_message:
-                    continue
-
-                # get the message ID from ContentText.modelJson
-                content_message_id: str | None = None
-                if isinstance(content.internal, dict) and "id" in content.internal:
-                    id_value = content.internal["id"]
-                    content_message_id = id_value if isinstance(id_value, str) else None
                 else:
-                    content_message_id = None
+                    raise ValueError(
+                        f"OpenAI Responses: Unspected tool_type '{tool_type}'"
+                    )
+            case ContentText(text=text, refusal=refusal):
+                # see if we have a message id
+                message_id: str | None = None
+                if (
+                    isinstance(content.internal, dict)
+                    and MESSAGE_ID in content.internal
+                ):
+                    id_value = content.internal[MESSAGE_ID]
+                    message_id = id_value if isinstance(id_value, str) else None
+                else:
+                    message_id = None
 
-                new_content = (
+                # see if we need to flush d
+                if message_id is not pending_response_output_id:
+                    flush_pending_context_text()
+
+                # register pending output
+                pending_response_output_id = message_id
+                pending_response_output.append(
                     ResponseOutputRefusalParam(type="refusal", refusal=text)
                     if refusal
                     else ResponseOutputTextParam(
-                        type="output_text", text=text, annotations=[]
+                        type="output_text", text=text, annotations=[], logprobs=[]
                     )
                 )
 
-                if content_message_id not in messages_by_id:
-                    messages_by_id[content_message_id] = []
-                messages_by_id[content_message_id].append(new_content)
+    # final flush if necessary
+    flush_pending_context_text()
 
-    # create ResponseOutputMessage for each unique ID
-    for msg_id, content_list in messages_by_id.items():
-        output_message = ResponseOutputMessageParam(
-            type="message",
-            role="assistant",
-            # this actually can be `None`, and it will in fact be `None` when the
-            # assistant message is synthesized by the scaffold as opposed to being
-            # replayed from the model
-            id=msg_id,  # type: ignore[typeddict-item]
-            content=content_list,
-            status="completed",
-        )
-        items.append(output_message)
-
-    return items + _tool_call_items_from_assistant_message(message, tool_message_ids)
+    return items + _tool_call_items_from_assistant_message(message)
 
 
 def _model_tool_call_for_internal(
@@ -446,28 +975,29 @@ def _maybe_native_tool_param(
 ) -> ToolParam | None:
     return (
         (
-            maybe_computer_use_preview_tool(tool)
+            maybe_computer_use_preview_tool(model_name, tool)
             or maybe_web_search_tool(model_name, tool)
+            or maybe_mcp_tool(tool)
+            or maybe_code_interpreter_tool(model_name, tool)
             # or self.text_editor_tool_param(tool)
             # or self.bash_tool_param(tool)
         )
-        if config.internal_tools or True
+        if config.internal_tools is not False
         else None
     )
 
 
 def _tool_call_items_from_assistant_message(
-    message: ChatMessageAssistant, tool_message_ids: dict[str, str]
+    message: ChatMessageAssistant,
 ) -> list[ResponseInputItemParam]:
     tool_calls: list[ResponseInputItemParam] = []
+
+    # now standard tool calls
     for call in message.tool_calls or []:
-        if isinstance(call.internal, dict):
-            tool_calls.append(
-                cast(
-                    _ResponseToolCallParam,
-                    _model_tool_call_for_internal(call.internal).model_dump(),
-                )
-            )
+        # see if we have it in assistant_internal
+        assistant_internal_call = assistant_internal().tool_calls.get(call.id, None)
+        if assistant_internal_call is not None:
+            tool_calls.append(assistant_internal_call)
         else:
             # create param
             tool_call_param: ResponseFunctionToolCallParam = dict(
@@ -477,28 +1007,10 @@ def _tool_call_items_from_assistant_message(
                 arguments=json.dumps(call.arguments),
             )
 
-            # add id if available
-            tool_message_id = tool_message_ids.get(call.id, None)
-            if tool_message_id is not None:
-                tool_call_param["id"] = tool_message_id
-
             # append the param
             tool_calls.append(tool_call_param)
 
     return tool_calls
-
-
-def _ids_from_assistant_internal(
-    message: ChatMessageAssistant,
-) -> dict[str, str]:
-    if message.internal is not None:
-        assert isinstance(message.internal, dict), (
-            "OpenAI ChatMessageAssistant internal must be an _AssistantInternal"
-        )
-        internal = cast(_AssistantInternal, message.internal)
-        return internal["tool_message_ids"]
-    else:
-        return {}
 
 
 _ResponseToolCallParam = (
@@ -506,8 +1018,24 @@ _ResponseToolCallParam = (
     | ResponseComputerToolCallParam
     | ResponseFunctionWebSearchParam
     # | ResponseFileSearchToolCallParam
-    # | ResponseFunctionToolCallParam
 )
+
+
+def maybe_mcp_tool(tool: ToolInfo) -> Mcp | None:
+    if is_mcp_server_tool(tool):
+        mcp_server = MCPServerConfigHTTP.model_validate(tool.options)
+        return Mcp(
+            type="mcp",
+            server_label=mcp_server.name,
+            server_url=mcp_server.url,
+            headers=mcp_server.headers,
+            allowed_tools=mcp_server.tools
+            if isinstance(mcp_server.tools, list)
+            else None,
+            require_approval="never",
+        )
+    else:
+        return None
 
 
 def _tool_param_for_tool_info(
@@ -515,15 +1043,26 @@ def _tool_param_for_tool_info(
     model_name: str,
     config: GenerateConfig,
 ) -> ToolParam:
-    # Use a native tool implementation when available. Otherwise, use the
-    # standard tool implementation
-    return _maybe_native_tool_param(tool, model_name, config) or FunctionToolParam(
-        type="function",
-        name=_responses_tool_alias(tool.name),
-        description=tool.description,
-        parameters=tool.parameters.model_dump(exclude_none=True),
-        strict=False,  # default parameters don't work in strict mode
-    )
+    # Use a native tool implementation when available.
+    tool_param = _maybe_native_tool_param(tool, model_name, config)
+    if tool_param is not None:
+        return tool_param
+
+    if tool.options is not None and "custom_format" in tool.options:
+        return CustomToolParam(
+            type="custom",
+            name=tool.name,
+            description=tool.description,
+            format=tool.options["custom_format"],
+        )
+    else:
+        return FunctionToolParam(
+            type="function",
+            name=_responses_tool_alias(tool.name),
+            description=tool.description,
+            parameters=tool.parameters.model_dump(exclude_none=True),
+            strict=False,  # default parameters don't work in strict mode
+        )
 
 
 # these functions enables us to 'escape' built in tool names like 'python'
@@ -539,7 +1078,17 @@ def _from_responses_tool_alias(name: str) -> str:
     return next((k for k, v in _responses_tool_aliases.items() if v == name), name)
 
 
-def _to_inspect_citation(input: Annotation) -> Citation:
+def to_inspect_citation(input: Annotation | AnnotationParam) -> Citation:
+    if isinstance(input, dict):
+        if input["type"] == "url_citation":
+            input = AnnotationURLCitation.model_validate(input)
+        elif input["type"] == "file_path":
+            input = AnnotationFilePath.model_validate(input)
+        elif input["type"] == "file_citation":
+            input = AnnotationFileCitation.model_validate(input)
+        else:
+            assert False, f"Unexpected citation type: {input['type']}"
+
     match input:
         case AnnotationURLCitation(
             end_index=end_index, start_index=start_index, title=title, url=url
@@ -553,27 +1102,260 @@ def _to_inspect_citation(input: Annotation) -> Citation:
             | AnnotationFilePath(file_id=file_id, index=index)
         ):
             return DocumentCitation(internal={"file_id": file_id, "index": index})
-    assert False, f"Unexpected citation type: {input.type}"
+
+        case _:
+            assert False, f"Unexpected citation type: {input.type}"
 
 
 def _filter_consecutive_reasoning_blocks(
-    content_list: list[ContentText | ContentReasoning],
-) -> list[ContentText | ContentReasoning]:
-    return [
-        content
-        for i, content in enumerate(content_list)
-        if _should_keep_content(i, content, content_list)
-    ]
+    content_list: list[ContentText | ContentReasoning | ContentToolUse],
+) -> list[ContentText | ContentReasoning | ContentToolUse]:
+    return reduce(_reasoning_reducer, content_list, [])
 
 
-def _should_keep_content(
-    i: int,
-    content: ContentText | ContentReasoning,
-    content_list: list[ContentText | ContentReasoning],
-) -> bool:
+def _reasoning_reducer(
+    acc: list[ContentText | ContentReasoning | ContentToolUse],
+    curr: ContentText | ContentReasoning | ContentToolUse,
+) -> list[ContentText | ContentReasoning | ContentToolUse]:
+    # Keep only the last ContentReasoning in each consecutive run
+    if not acc:
+        acc = [curr]
+
+    # Replace previous with current if they're both ContentReasoning's
+    elif isinstance(acc[-1], ContentReasoning) and isinstance(curr, ContentReasoning):
+        acc[-1] = curr
+
+    else:
+        acc.append(curr)
+
+    return acc
+
+
+def is_input_text(
+    input: ResponseInputContentParam,
+) -> TypeGuard[ResponseInputTextParam]:
+    return input.get("type") == "input_text"
+
+
+def is_input_image(
+    input: ResponseInputContentParam,
+) -> TypeGuard[ResponseInputImageParam]:
+    return input.get("type") == "input_image"
+
+
+def is_input_file(
+    input: ResponseInputContentParam,
+) -> TypeGuard[ResponseInputFileParam]:
+    return input.get("type") == "input_file"
+
+
+def is_response_input_message(
+    param: ResponseInputItemParam,
+) -> TypeGuard[Message | EasyInputMessageParam]:
     return (
-        True
-        if not isinstance(content, ContentReasoning)
-        else i == len(content_list) - 1
-        or not isinstance(content_list[i + 1], ContentReasoning)
+        "role" in param and "content" in param and not is_response_output_message(param)
     )
+
+
+def is_function_call_output(
+    param: ResponseInputItemParam,
+) -> TypeGuard[FunctionCallOutput]:
+    return param["type"] == "function_call_output"
+
+
+def is_custom_tool_call_output(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseCustomToolCallOutputParam]:
+    return param["type"] == "custom_tool_call_output"
+
+
+def is_computer_call_output(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ComputerCallOutput]:
+    return param["type"] == "computer_call_output"
+
+
+def is_assistant_message_param(
+    param: ResponseInputItemParam,
+) -> bool:
+    return "type" in param and (
+        is_response_output_message(param)
+        or is_response_computer_tool_call(param)
+        or is_response_web_search_call(param)
+        or is_response_function_tool_call(param)
+        or is_response_custom_tool_call(param)
+        or is_response_reasoning_item(param)
+        or is_response_mcp_list_tools(param)
+        or is_response_mcp_call(param)
+    )
+
+
+def is_response_output_message(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseOutputMessageParam]:
+    return (
+        "type" in param
+        and param["type"] == "message"
+        and param["role"] == "assistant"
+        and isinstance(param.get("content", None), list)
+        and any(
+            c.get("type", "") in ["output_text", "refusal"]
+            for c in cast(list[dict[str, Any]], param["content"])
+        )
+    )
+
+
+def is_response_output_text(
+    output: OutputContent,
+) -> TypeGuard[ResponseOutputTextParam]:
+    return output["type"] == "output_text"
+
+
+def is_response_output_refusal(
+    output: OutputContent,
+) -> TypeGuard[ResponseOutputRefusalParam]:
+    return output["type"] == "refusal"
+
+
+def is_response_computer_tool_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseComputerToolCallParam]:
+    return param["type"] == "computer_call"
+
+
+def is_response_web_search_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseFunctionWebSearchParam]:
+    return param["type"] == "web_search_call"
+
+
+def is_response_code_interpreter_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseCodeInterpreterToolCallParam]:
+    return param["type"] == "code_interpreter_call"
+
+
+def is_response_function_tool_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseFunctionToolCallParam]:
+    return param["type"] == "function_call"
+
+
+def is_response_reasoning_item(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseReasoningItemParam]:
+    return param["type"] == "reasoning"
+
+
+def is_response_mcp_list_tools(
+    param: ResponseInputItemParam,
+) -> TypeGuard[McpListToolsParam]:
+    return param["type"] == "mcp_list_tools"
+
+
+def is_response_mcp_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[McpCallParam]:
+    return param["type"] == "mcp_call"
+
+
+def is_response_custom_tool_call(
+    param: ResponseInputItemParam,
+) -> TypeGuard[ResponseCustomToolCallParam]:
+    return param["type"] == "custom_tool_call"
+
+
+def is_function_tool_param(tool_param: ToolParam) -> TypeGuard[FunctionToolParam]:
+    return tool_param.get("type") == "function"
+
+
+def is_web_search_tool_param(tool_param: ToolParam) -> TypeGuard[WebSearchToolParam]:
+    return tool_param.get("type") in ["web_search", "web_search_2025_08_26"]
+
+
+def is_code_interpreter_tool_param(
+    tool_param: ToolParam,
+) -> TypeGuard[CodeInterpreter]:
+    return tool_param.get("type") == "code_interpreter"
+
+
+def is_mcp_tool_param(tool_param: ToolParam) -> TypeGuard[Mcp]:
+    return tool_param.get("type") == "mcp"
+
+
+def is_computer_tool_param(tool_param: ToolParam) -> TypeGuard[ComputerToolParam]:
+    return tool_param.get("type") == "computer_use_preview"
+
+
+def is_custom_tool_param(tool_param: ToolParam) -> TypeGuard[CustomToolParam]:
+    return tool_param.get("type") == "custom"
+
+
+def maybe_code_interpreter_tool(
+    model_name: str, tool: ToolInfo
+) -> CodeInterpreter | None:
+    COMPATIBLE_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3", "o4-mini", "gpt-5"]
+    if (
+        tool.name == "code_execution"
+        and tool.options
+        and any(model_name.startswith(model) for model in COMPATIBLE_MODELS)
+    ):
+        providers: dict[str, Any] = tool.options.get("providers", {})
+        options: dict[str, Any] | bool = providers.get("openai", False)
+        if options is False:
+            return None
+        if options is True:
+            return CodeInterpreter(
+                type="code_interpreter",
+                container=CodeInterpreterContainerCodeInterpreterToolAuto(type="auto"),
+            )
+        else:
+            container = options.get(
+                "container",
+                CodeInterpreterContainerCodeInterpreterToolAuto(type="auto"),
+            )
+
+            return CodeInterpreter(
+                type="code_interpreter",
+                container=container,
+            )
+
+    else:
+        return None
+
+
+def code_interpreter_to_tool_use(
+    code_interpreter: ResponseCodeInterpreterToolCall,
+) -> ContentToolUse:
+    return ContentToolUse(
+        type="tool_use",
+        tool_type="code_execution",
+        id=code_interpreter.id,
+        name=code_interpreter.type,
+        arguments=code_interpreter.code or "",
+        result=_outputs_to_result(code_interpreter.outputs),
+        error="failed" if code_interpreter.status == "failed" else None,
+    )
+
+
+def tool_use_to_code_interpreter_param(
+    content: ContentToolUse,
+) -> ResponseCodeInterpreterToolCallParam:
+    return ResponseCodeInterpreterToolCallParam(
+        type="code_interpreter_call",
+        id=content.id,
+        code=content.arguments,
+        container_id="",
+        outputs=[OutputLogsParam(type="logs", logs=content.result)],
+        status="failed" if content.error else "completed",
+    )
+
+
+def _outputs_to_result(outputs: list[OutputLogs | OutputImage] | None) -> str:
+    if outputs is not None:
+        return "\n\n".join(
+            output.logs if isinstance(output, OutputLogs) else f"image: {output.url}"
+            for output in outputs
+        )
+    else:
+        return ""

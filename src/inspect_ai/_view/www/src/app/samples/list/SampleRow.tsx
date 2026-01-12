@@ -1,46 +1,71 @@
 import clsx from "clsx";
 import { FC, ReactNode } from "react";
 import { SampleSummary } from "../../../client/api/types";
-import { MarkdownDiv } from "../../../components/MarkdownDiv";
 import { PulsingDots } from "../../../components/PulsingDots";
 import { useStore } from "../../../state/store";
 import { arrayToString, inputString } from "../../../utils/format";
+import { isVscode } from "../../../utils/vscode";
+import { RenderedText } from "../../content/RenderedText";
 import { SampleErrorView } from "../error/SampleErrorView";
 import styles from "./SampleRow.module.css";
 
 interface SampleRowProps {
   id: string;
-  index: number;
   sample: SampleSummary;
   answer: string;
   completed: boolean;
-  scoreRendered: ReactNode;
+  scoresRendered: ReactNode[];
   gridColumnsTemplate: string;
   height: number;
+  selected: boolean;
   showSample: () => void;
   sampleUrl?: string;
 }
 
+const kMaxRowTextSize = 1024 * 5;
+
 export const SampleRow: FC<SampleRowProps> = ({
   id,
-  index,
   sample,
   answer,
   completed,
-  scoreRendered,
+  scoresRendered,
   gridColumnsTemplate,
   height,
+  selected,
   showSample,
   sampleUrl,
 }) => {
   const streamSampleData = useStore(
     (state) => state.capabilities.streamSampleData,
   );
-  const selectedSampleIndex = useStore(
-    (state) => state.log.selectedSampleIndex,
-  );
+
   // Determine if this sample can be viewed (completed or streaming)
   const isViewable = completed || streamSampleData;
+
+  // This is used to screen out content when the sample dialog is open
+  // this allows the sample list to retain precise state (since it remains loaded)
+  // while not causing text content to be present in the DOM
+  const showingSampleDialog = useStore((state) => state.app.dialogs.sample);
+
+  if (
+    !completed &&
+    scoresRendered.length === 0 &&
+    Object.keys(sample.scores || {}).length === 0
+  ) {
+    scoresRendered = [null];
+  }
+  const scoreColumnContent = scoresRendered.map((scoreRendered, i) => {
+    if (!showingSampleDialog && sample.error) {
+      return <SampleErrorView message={sample.error} />;
+    } else if (completed) {
+      return scoreRendered;
+    } else if (i === scoresRendered.length - 1) {
+      return <PulsingDots subtle={false} />;
+    } else {
+      return undefined;
+    }
+  });
 
   const rowContent = (
     <div
@@ -48,7 +73,7 @@ export const SampleRow: FC<SampleRowProps> = ({
       className={clsx(
         styles.grid,
         "text-size-base",
-        selectedSampleIndex === index ? styles.selected : undefined,
+        selected ? styles.selected : undefined,
         !isViewable && !sampleUrl ? styles.disabled : undefined,
       )}
       style={{
@@ -58,7 +83,7 @@ export const SampleRow: FC<SampleRowProps> = ({
       }}
     >
       <div className={clsx("sample-id", "three-line-clamp", styles.cell)}>
-        {sample.id}
+        {!showingSampleDialog ? sample.id : undefined}
       </div>
       <div
         className={clsx(
@@ -68,21 +93,33 @@ export const SampleRow: FC<SampleRowProps> = ({
           styles.wrapAnywhere,
         )}
       >
-        <MarkdownDiv markdown={inputString(sample.input).join(" ")} />
+        {!showingSampleDialog ? (
+          <RenderedText
+            markdown={inputString(sample.input)
+              .join(" ")
+              .slice(0, kMaxRowTextSize)}
+            forceRender={true}
+            omitMedia={true}
+          />
+        ) : undefined}
       </div>
       <div className={clsx("sample-target", "three-line-clamp", styles.cell)}>
-        {sample?.target ? (
-          <MarkdownDiv
-            markdown={arrayToString(sample.target)}
+        {sample?.target && !showingSampleDialog ? (
+          <RenderedText
+            markdown={arrayToString(sample.target).slice(0, kMaxRowTextSize)}
             className={clsx("no-last-para-padding", styles.noLeft)}
+            forceRender={true}
+            omitMedia={true}
           />
         ) : undefined}
       </div>
       <div className={clsx("sample-answer", "three-line-clamp", styles.cell)}>
-        {sample ? (
-          <MarkdownDiv
-            markdown={answer || ""}
+        {sample && !showingSampleDialog ? (
+          <RenderedText
+            markdown={(answer || "").slice(0, kMaxRowTextSize)}
             className={clsx("no-last-para-padding", styles.noLeft)}
+            forceRender={true}
+            omitMedia={true}
           />
         ) : (
           ""
@@ -96,7 +133,7 @@ export const SampleRow: FC<SampleRowProps> = ({
           styles.cell,
         )}
       >
-        {sample.limit}
+        {!showingSampleDialog ? sample.limit : undefined}
       </div>
       <div
         className={clsx(
@@ -107,20 +144,39 @@ export const SampleRow: FC<SampleRowProps> = ({
           styles.centered,
         )}
       >
-        {sample.retries && sample.retries > 0 ? sample.retries : undefined}
+        {!showingSampleDialog && sample.retries && sample.retries > 0
+          ? sample.retries
+          : undefined}
       </div>
-      <div className={clsx("text-size-small", styles.cell, styles.score)}>
-        {sample.error ? (
-          <SampleErrorView message={sample.error} />
-        ) : completed ? (
-          scoreRendered
-        ) : (
-          <PulsingDots subtle={false} />
-        )}
-      </div>
+      {scoreColumnContent.map((scoreColumnContent, i) => (
+        <div
+          key={`score-${i}`}
+          className={clsx("text-size-small", styles.cell, styles.score)}
+        >
+          {scoreColumnContent}
+        </div>
+      ))}
     </div>
   );
 
-  // Render the row content either as a link or directly
-  return <div onClick={showSample}>{rowContent}</div>;
+  // If no sample URL available or not viewable, render as div
+  if (!sampleUrl || !isViewable) {
+    return <div className={styles.disabledRow}>{rowContent}</div>;
+  }
+
+  // VS code doesn't support navigating links
+  if (isVscode()) {
+    return (
+      <div onClick={showSample} className={styles.sampleLink}>
+        {rowContent}
+      </div>
+    );
+  }
+
+  // Render as a proper link
+  return (
+    <a href={sampleUrl} className={styles.sampleLink}>
+      {rowContent}
+    </a>
+  );
 };

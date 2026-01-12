@@ -3,15 +3,8 @@ import "prismjs/components/prism-json";
 import "prismjs/components/prism-python";
 
 import clsx from "clsx";
-import { FC, Fragment, useMemo } from "react";
-import {
-  ModelCall,
-  ModelEvent,
-  Request,
-  Response,
-  ToolChoice,
-  Tools1,
-} from "../../../@types/log";
+import { FC, Fragment, useMemo, useRef } from "react";
+import { ModelCall, ModelEvent, ToolChoice, Tools1 } from "../../../@types/log";
 import { ApplicationIcons } from "../../appearance/icons";
 import { MetaDataGrid } from "../../content/MetaDataGrid";
 import { ModelUsagePanel } from "../../usage/ModelUsagePanel";
@@ -22,6 +15,7 @@ import { EventSection } from "./event/EventSection";
 import { PulsingDots } from "../../../components/PulsingDots";
 import { usePrismHighlight } from "../../../state/hooks";
 import styles from "./ModelEventView.module.css";
+import { EventNodeContext } from "./TranscriptVirtualList";
 import { EventTimingPanel } from "./event/EventTimingPanel";
 import { formatTiming, formatTitle } from "./event/utils";
 import { EventNode } from "./types";
@@ -29,6 +23,8 @@ import { EventNode } from "./types";
 interface ModelEventViewProps {
   eventNode: EventNode<ModelEvent>;
   className?: string | string[];
+  showToolCalls: boolean;
+  context?: EventNodeContext;
 }
 
 /**
@@ -36,7 +32,9 @@ interface ModelEventViewProps {
  */
 export const ModelEventView: FC<ModelEventViewProps> = ({
   eventNode,
+  showToolCalls,
   className,
+  context,
 }) => {
   const event = eventNode.event;
   const totalUsage = event.output.usage?.total_tokens;
@@ -56,8 +54,15 @@ export const ModelEventView: FC<ModelEventViewProps> = ({
   // are already shown in the tool call above)
   const userMessages = [];
   for (const msg of event.input.slice().reverse()) {
-    if ((msg.role === "user" && !msg.tool_call_id) || msg.role === "system") {
-      userMessages.push(msg);
+    if (
+      (msg.role === "user" && !msg.tool_call_id) ||
+      msg.role === "system" ||
+      // If the client doesn't support tool events, then tools messages are allowed to be displayed
+      // in this view, since no tool events will be shown. This pretty much happens for bridged agents
+      // where tool events aren't captured.
+      (context?.hasToolEvents === false && msg.role === "tool")
+    ) {
+      userMessages.unshift(msg);
     } else {
       break;
     }
@@ -81,7 +86,9 @@ export const ModelEventView: FC<ModelEventViewProps> = ({
           id={`${eventNode.id}-model-output`}
           messages={[...userMessages, ...(outputMessages || [])]}
           numbered={false}
-          toolCallStyle="omit"
+          toolCallStyle={showToolCalls ? "complete" : "omit"}
+          resolveToolCallsIntoPreviousMessage={context?.hasToolEvents !== false}
+          allowLinking={false}
         />
         {event.pending ? (
           <div className={clsx(styles.progress)}>
@@ -120,6 +127,10 @@ export const ModelEventView: FC<ModelEventViewProps> = ({
           <ChatView
             id={`${eventNode.id}-model-input-full`}
             messages={[...event.input, ...(outputMessages || [])]}
+            resolveToolCallsIntoPreviousMessage={
+              context?.hasToolEvents !== false
+            }
+            allowLinking={false}
           />
         </EventSection>
       </div>
@@ -149,17 +160,25 @@ interface APIViewProps {
 }
 
 export const APIView: FC<APIViewProps> = ({ call, className }) => {
+  const requestCode = useMemo(() => {
+    return JSON.stringify(call.request, undefined, 2);
+  }, [call.request]);
+
+  const responseCode = useMemo(() => {
+    return JSON.stringify(call.response, undefined, 2);
+  }, [call.response]);
+
   if (!call) {
     return null;
   }
 
   return (
     <div className={clsx(className)}>
-      <EventSection title="Request">
-        <APICodeCell contents={call.request} />
+      <EventSection title="Request" copyContent={requestCode}>
+        <APICodeCell sourceCode={requestCode} />
       </EventSection>
-      <EventSection title="Response">
-        <APICodeCell contents={call.response} />
+      <EventSection title="Response" copyContent={responseCode}>
+        <APICodeCell sourceCode={responseCode} />
       </EventSection>
     </div>
   );
@@ -167,21 +186,19 @@ export const APIView: FC<APIViewProps> = ({ call, className }) => {
 
 interface APICodeCellProps {
   id?: string;
-  contents: Request | Response;
+  sourceCode: string;
 }
 
-export const APICodeCell: FC<APICodeCellProps> = ({ id, contents }) => {
-  const sourceCode = useMemo(() => {
-    return JSON.stringify(contents, undefined, 2);
-  }, [contents]);
-  const prismParentRef = usePrismHighlight(sourceCode);
+export const APICodeCell: FC<APICodeCellProps> = ({ id, sourceCode }) => {
+  const sourceCodeRef = useRef<HTMLDivElement | null>(null);
+  usePrismHighlight(sourceCodeRef, sourceCode.length);
 
-  if (!contents) {
+  if (!sourceCode) {
     return null;
   }
 
   return (
-    <div ref={prismParentRef} className={clsx("model-call")}>
+    <div ref={sourceCodeRef} className={clsx("model-call")}>
       <pre className={clsx(styles.codePre)}>
         <code
           id={id}

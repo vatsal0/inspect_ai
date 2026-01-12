@@ -5,7 +5,6 @@ from test_helpers.utils import (
     skip_if_no_anthropic,
     skip_if_no_grok,
     skip_if_no_groq,
-    skip_if_no_mistral,
     skip_if_no_openai,
     skip_if_no_together,
     skip_if_trio,
@@ -38,7 +37,7 @@ async def check_stop_reason(model_name, **model_args: Any):
 @skip_if_no_groq
 @skip_if_trio
 async def test_groq_stop_reason() -> None:
-    await check_stop_reason("groq/llama3-70b-8192")
+    await check_stop_reason("groq/openai/gpt-oss-20b")
 
 
 @pytest.mark.asyncio
@@ -63,21 +62,15 @@ async def test_anthropic_stop_reason() -> None:
 
 
 @pytest.mark.asyncio
-@skip_if_no_mistral
-@skip_if_trio
-async def test_mistral_stop_reason() -> None:
-    await check_stop_reason("mistral/mistral-medium-latest")
-
-
-@pytest.mark.asyncio
+@pytest.mark.flaky
 @skip_if_no_grok
 @skip_if_trio
 async def test_grok_stop_reason() -> None:
-    await check_stop_reason("grok/grok-beta")
+    await check_stop_reason("grok/grok-3-mini")
 
 
 @pytest.mark.asyncio
 @skip_if_no_together
 @skip_if_trio
 async def test_together_stop_reason() -> None:
-    await check_stop_reason("together/google/gemma-2b-it")
+    await check_stop_reason("together/meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo")

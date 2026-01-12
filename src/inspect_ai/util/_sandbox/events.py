@@ -1,6 +1,7 @@
 import contextlib
+import inspect
 import shlex
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterator, Literal, Type, Union, overload
 
 from pydantic import JsonValue
@@ -16,6 +17,7 @@ from .environment import (
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
 )
+from .service import SERVICES_DIR
 
 
 class SandboxEnvironmentProxy(SandboxEnvironment):
@@ -33,16 +35,35 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
         user: str | None = None,
         timeout: int | None = None,
         timeout_retry: bool = True,
+        concurrency: bool = True,
     ) -> ExecResult[str]:
-        from inspect_ai.log._transcript import SandboxEvent, transcript
+        from inspect_ai.event._sandbox import SandboxEvent
+        from inspect_ai.log._transcript import transcript
 
         # started
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
+
+        # check how many parameters the target sandbox method has
+        # (if only 7 then don't send concurrency param)
+        sig = inspect.signature(self._sandbox.exec)
+        params: dict[str, Any] = dict(
+            cmd=cmd,
+            input=input,
+            cwd=cwd,
+            env=env,
+            user=user,
+            timeout=timeout,
+            timeout_retry=timeout_retry,
+        )
+        if len(sig.parameters) == 8:
+            params["concurrency"] = concurrency
 
         # make call
-        result = await self._sandbox.exec(
-            cmd, input, cwd, env, user, timeout, timeout_retry
-        )
+        result = await self._sandbox.exec(**params)
+
+        # skip sandbox service events
+        if any(SERVICES_DIR in c for c in cmd):
+            return result
 
         # yield event
         options: dict[str, JsonValue] = {}
@@ -71,7 +92,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
                         if result.stderr
                         else result.stdout
                     ),
-                    completed=datetime.now(),
+                    completed=datetime.now(timezone.utc),
                 )
             )
 
@@ -80,9 +101,10 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
 
     @override
     async def write_file(self, file: str, contents: str | bytes) -> None:
-        from inspect_ai.log._transcript import SandboxEvent, transcript
+        from inspect_ai.event._sandbox import SandboxEvent
+        from inspect_ai.log._transcript import transcript
 
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
 
         # make call
         await self._sandbox.write_file(file, contents)
@@ -95,7 +117,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
                     action="write_file",
                     file=file,
                     input=content_display(contents),
-                    completed=datetime.now(),
+                    completed=datetime.now(timezone.utc),
                 )
             )
 
@@ -107,9 +129,10 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
 
     @override
     async def read_file(self, file: str, text: bool = True) -> Union[str | bytes]:
-        from inspect_ai.log._transcript import SandboxEvent, transcript
+        from inspect_ai.event._sandbox import SandboxEvent
+        from inspect_ai.log._transcript import transcript
 
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
 
         # make call
         if text is True:
@@ -125,7 +148,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
                     action="read_file",
                     file=file,
                     output=content_display(output),
-                    completed=datetime.now(),
+                    completed=datetime.now(timezone.utc),
                 )
             )
 
@@ -145,6 +168,10 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
             raise TypeError(
                 f"Expected instance of {sandbox_cls.__name__}, got {type(self._sandbox).__name__}"
             )
+
+    @override
+    def default_polling_interval(self) -> float:
+        return self._sandbox.default_polling_interval()
 
     @contextlib.contextmanager
     def no_events(self) -> Iterator[None]:

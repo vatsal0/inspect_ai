@@ -1,8 +1,12 @@
 import re
+from typing import Literal
+
+import pytest
 
 from inspect_ai import Task, eval
 from inspect_ai._util.content import ContentReasoning, ContentText
 from inspect_ai.agent._agent import Agent, AgentState, agent
+from inspect_ai.agent._filter import MessageFilter
 from inspect_ai.agent._handoff import handoff
 from inspect_ai.agent._react import react
 from inspect_ai.agent._types import (
@@ -96,15 +100,19 @@ def run_react_agent(
         scorer=includes(),
         message_limit=message_limit,
     )
-
     model = get_model(
         "mockllm/model",
         custom_outputs=[
             ModelOutput.for_tool_call(
                 model="mockllm/model",
-                tool_name=submit.name or ToolDef(submit.tool).name
-                if submit.tool
-                else AGENT_SUBMIT_TOOL_NAME,
+                tool_name=submit.name
+                or (
+                    submit.tool.name
+                    if isinstance(submit.tool, ToolDef)
+                    else ToolDef(submit.tool).name
+                    if submit.tool
+                    else AGENT_SUBMIT_TOOL_NAME
+                ),
                 tool_arguments={"answer": "2"},
             )
         ],
@@ -554,3 +562,247 @@ def test_remove_submit_tool_filters_reasoning_content():
         "Reasoning content should remain when no submit tool call is filtered"
     )
     assert reasoning_content[0].reasoning == "This reasoning should stay"
+
+
+@pytest.mark.parametrize(
+    ("truncation", "expected_message_count", "expected_submit"),
+    [
+        pytest.param(
+            "auto", 142, True, id="with_auto_truncation"
+        ),  # sys msg + 0.7 * 200
+        pytest.param(
+            "disabled", 201, False, id="with_disabled_truncation"
+        ),  # no submit (agent terminates)
+    ],
+)
+def test_react_agent_truncation(
+    truncation: Literal["auto", "disabled"] | MessageFilter,
+    expected_message_count: int,
+    expected_submit: bool,
+):
+    """Test the react agent with different truncation settings"""
+    task = Task(
+        dataset=[Sample(input="What is the capital of Denmark?", target="Copenhagen")],
+        solver=react(truncation=truncation),
+        scorer=includes(),
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            *(
+                [
+                    ModelOutput.from_content(
+                        model="mockllm/model",
+                        content="This is a repeated message",
+                    )
+                ]
+                * 99
+            ),
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="Final message with stop_reason=model_length",
+                stop_reason="model_length",
+            ),
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "Copenhagen"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.results
+
+    assert log.samples and (sample := log.samples[0])
+    assert len(sample.messages) == expected_message_count
+    last_message = sample.messages[-1]
+    assert (
+        last_message.content == "tool call for tool submit\n\nCopenhagen"
+    ) == expected_submit
+
+    assert sample.scores and len(sample.scores) == 1
+    assert (score := sample.scores["includes"])
+    assert score.value == "C" if expected_submit else "I"
+
+
+def test_react_agent_retry_refusals_disabled() -> None:
+    """Test that without retry_refusals, the agent sees each refusal as a separate generation.
+
+    Without retry_refusals, a content_filter response is returned immediately.
+    The agent loop then continues (adding a "please continue" message) and
+    calls generate again. This test verifies that behavior by checking
+    that two model events occur (one refusal, one success).
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()]),
+        scorer=includes(),
+        message_limit=30,
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First generation: refusal (no retry, agent loop continues)
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help with that.",
+                stop_reason="content_filter",
+            ),
+            # Second generation: success (after agent sent continue message)
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "2"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.samples
+    # Without retry_refusals, we should see 2 model events
+    model_events = sum(
+        1 for event in log.samples[0].transcript.events if event.event == "model"
+    )
+    assert model_events == 2
+
+
+def test_react_agent_retry_refusals_success() -> None:
+    """Test that with retry_refusals, refusals are retried within a single generation.
+
+    With retry_refusals=2, up to 2 retry attempts are made within a single
+    _model_generate call. The key difference from no retry_refusals is that
+    the refusal message is NOT added to the conversation - only the successful
+    response is added.
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()], retry_refusals=2),
+        scorer=includes(),
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First attempt within _model_generate: refusal (triggers retry)
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help with that.",
+                stop_reason="content_filter",
+            ),
+            # Second attempt within _model_generate: success
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "2"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 1
+    # With retry_refusals, only the successful response is added to messages
+    # (the refusal is discarded). So we should see only 1 assistant message.
+    assert log.samples
+    assistant_messages = [
+        m for m in log.samples[0].messages if isinstance(m, ChatMessageAssistant)
+    ]
+    assert len(assistant_messages) == 1
+    # The refusal content should NOT be in any message
+    assert not any("cannot help" in m.text for m in assistant_messages)
+
+
+def test_react_agent_retry_refusals_exhausted() -> None:
+    """Test that when retries are exhausted, the final refusal is returned.
+
+    With retry_refusals=2, after 3 consecutive refusals (initial + 2 retries),
+    the final refusal is returned and added to messages. The agent loop then
+    continues with a new generation attempt.
+    """
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()], retry_refusals=2),
+        scorer=includes(),
+        message_limit=30,
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First _model_generate call: 3 refusals (initial + 2 retries), exhausted
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help with that.",
+                stop_reason="content_filter",
+            ),
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I still cannot help.",
+                stop_reason="content_filter",
+            ),
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I really cannot help.",
+                stop_reason="content_filter",
+            ),
+            # Agent loop continues after exhaustion, second _model_generate call: success
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="submit",
+                tool_arguments={"answer": "2"},
+            ),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.samples
+    # After exhausting retries, the final refusal is added to messages.
+    # Then agent loop continues and adds the success. So 2 assistant messages.
+    assistant_messages = [
+        m for m in log.samples[0].messages if isinstance(m, ChatMessageAssistant)
+    ]
+    assert len(assistant_messages) == 2
+    # The final refusal should be in the first assistant message
+    assert "really cannot help" in assistant_messages[0].text
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 1
+
+
+def test_react_agent_retry_refusals_no_submit() -> None:
+    """Test retry_refusals with submit=False."""
+    task = Task(
+        dataset=addition_dataset(),
+        solver=react(tools=[addition()], submit=False, retry_refusals=1),
+        scorer=includes(),
+    )
+
+    model = get_model(
+        "mockllm/model",
+        custom_outputs=[
+            # First attempt: refusal (triggers retry)
+            ModelOutput.from_content(
+                model="mockllm/model",
+                content="I cannot help.",
+                stop_reason="content_filter",
+            ),
+            # Second attempt: success with tool call
+            ModelOutput.for_tool_call(
+                model="mockllm/model",
+                tool_name="addition",
+                tool_arguments={"x": 1, "y": 1},
+            ),
+            # Final response
+            ModelOutput.from_content(model="mockllm/model", content="2"),
+        ],
+    )
+
+    log = eval(task, model=model)[0]
+    assert log.status == "success"
+    assert log.results
+    assert log.results.scores[0].metrics["accuracy"].value == 1

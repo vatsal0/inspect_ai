@@ -2,12 +2,14 @@ import shutil
 import tempfile
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from test_helpers.utils import (
     failing_solver,
     failing_task,
     failing_task_deterministic,
+    identity_solver,
     keyboard_interrupt,
     skip_if_trio,
     sleep_for_solver,
@@ -18,12 +20,23 @@ from inspect_ai._eval.evalset import (
     eval_set,
     latest_completed_task_eval_logs,
     list_all_eval_logs,
+    task_identifier,
+    validate_eval_set_prerequisites,
 )
+from inspect_ai._eval.loader import resolve_tasks
+from inspect_ai._eval.task.resolved import ResolvedTask
+from inspect_ai._eval.task.task import task_with
+from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.file import basename, size_in_mb
 from inspect_ai.dataset import Sample
+from inspect_ai.log._edit import ProvenanceData, invalidate_samples
 from inspect_ai.log._file import list_eval_logs, read_eval_log, write_eval_log
+from inspect_ai.log._log import EvalLog
 from inspect_ai.model import get_model
+from inspect_ai.model._generate_config import GenerateConfig
+from inspect_ai.scorer import exact
 from inspect_ai.scorer._match import includes
-from inspect_ai.solver import generate
+from inspect_ai.solver import Solver, generate
 
 
 def test_eval_set() -> None:
@@ -62,7 +75,8 @@ def test_eval_set() -> None:
 
 
 @pytest.mark.slow
-def test_eval_set_dynamic() -> None:
+@pytest.mark.parametrize("eval_set_id", [None, "test-eval-set-id"])
+def test_eval_set_dynamic(eval_set_id: str | None) -> None:
     with tempfile.TemporaryDirectory() as log_dir:
         dataset: list[Sample] = []
         for _ in range(0, 10):
@@ -85,9 +99,17 @@ def test_eval_set_dynamic() -> None:
             model=[get_model("mockllm/model"), get_model("mockllm/model2")],
             retry_attempts=10000,
             retry_wait=0.001,
+            eval_set_id=eval_set_id,
         )
         assert len(logs) == 4
         assert success
+        eval_set_ids = [log.eval.eval_set_id for log in logs]
+        assert eval_set_ids[0] is not None
+        assert len(set(eval_set_ids)) == 1
+        if eval_set_id:
+            assert eval_set_ids[0] == eval_set_id
+        else:
+            assert eval_set_ids[0] is not None
 
 
 def test_eval_set_identifiers() -> None:
@@ -152,6 +174,67 @@ def test_latest_completed_task_eval_logs() -> None:
         assert len(list_eval_logs(clean_dir.as_posix())) == 1
     finally:
         shutil.rmtree(clean_dir, ignore_errors=True)
+
+
+def test_validate_eval_set_prerequisites_ok() -> None:
+    # cleanup previous tests
+    TEST_EVAL_SET_PATH = Path("tests/test_eval_set")
+
+    # verify we correctly select only the most recent log
+    all_logs = list_all_eval_logs(TEST_EVAL_SET_PATH.as_posix())
+    resolved_tasks = resolve_tasks(
+        "examples/popularity.py", {}, get_model("mockllm/model"), None, None, None
+    )
+    task_with(resolved_tasks[0].task, config=GenerateConfig(temperature=1.0))
+
+    all_logs = validate_eval_set_prerequisites(
+        resolved_tasks=resolved_tasks,
+        all_logs=all_logs,
+        log_dir_allow_dirty=False,
+        config=GenerateConfig(),
+        eval_set_solver=None,
+    )
+    assert len(all_logs) == 2
+
+
+def test_validate_eval_set_prerequisites_mismatch() -> None:
+    # cleanup previous tests
+    TEST_EVAL_SET_PATH = Path("tests/test_eval_set")
+
+    # verify we correctly select only the most recent log
+    all_logs = list_all_eval_logs(TEST_EVAL_SET_PATH.as_posix())
+    resolved_tasks = resolve_tasks(
+        "examples/hello_world.py", {}, get_model("mockllm/model"), None, None, None
+    )
+
+    with pytest.raises(PrerequisiteError):
+        validate_eval_set_prerequisites(
+            resolved_tasks=resolved_tasks,
+            all_logs=all_logs,
+            log_dir_allow_dirty=False,
+            config=GenerateConfig(),
+            eval_set_solver=None,
+        )
+
+
+def test_validate_eval_set_prerequisites_mismatch_log_dir_allow_dirty() -> None:
+    # cleanup previous tests
+    TEST_EVAL_SET_PATH = Path("tests/test_eval_set")
+
+    # verify we correctly select only the most recent log
+    all_logs = list_all_eval_logs(TEST_EVAL_SET_PATH.as_posix())
+    resolved_tasks = resolve_tasks(
+        "examples/hello_world.py", {}, get_model("mockllm/model"), None, None, None
+    )
+
+    all_logs = validate_eval_set_prerequisites(
+        resolved_tasks=resolved_tasks,
+        all_logs=all_logs,
+        log_dir_allow_dirty=True,
+        config=GenerateConfig(),
+        eval_set_solver=None,
+    )
+    assert len(all_logs) == 0
 
 
 @pytest.mark.slow
@@ -266,3 +349,570 @@ def sleep_for_3_task(task_arg: str):
     return Task(
         solver=[sleep_for_solver(3)],
     )
+
+
+def run_eval_set(
+    resolved_tasks: list[ResolvedTask],
+    solver: Solver | None = None,
+    config: GenerateConfig = GenerateConfig(temperature=0.7),
+) -> None:
+    tasks = [task.task for task in resolved_tasks]
+    with tempfile.TemporaryDirectory() as log_dir:
+        eval_set(
+            tasks=tasks,
+            log_dir=log_dir,
+            solver=solver,
+            **config.model_dump(),
+        )
+
+        all_logs = list_all_eval_logs(log_dir)
+
+        all_logs = validate_eval_set_prerequisites(
+            resolved_tasks=resolved_tasks,
+            all_logs=all_logs,
+            log_dir_allow_dirty=False,
+            config=config,
+            eval_set_solver=solver,
+        )
+        assert len(all_logs) == len(resolved_tasks)
+
+        eval_set(
+            tasks=tasks,
+            log_dir=log_dir,
+            solver=solver,
+            **config.model_dump(),
+        )
+
+
+@task
+def hello_world(arg: str = "arg", samples: int = 1) -> Task:
+    return Task(
+        dataset=[
+            Sample(
+                input=f"Just reply with Hello World {i}",
+                target="Hello World",
+            )
+            for i in range(samples)
+        ],
+        solver=[
+            generate(),
+        ],
+        scorer=exact(),
+    )
+
+
+def test_task_identifier_with_model_configs():
+    model1 = get_model("mockllm/model", config=GenerateConfig(temperature=0.7))
+    model2 = get_model("mockllm/model", config=GenerateConfig(temperature=0))
+    task1 = hello_world()
+    task2 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+    )
+    task_with(
+        task2,
+        model=model2,
+    )
+    resolved_tasks = resolve_tasks([task1, task2], {}, model1, None, None, None)
+
+    assert task_identifier(
+        resolved_tasks[0], GenerateConfig(), eval_set_solver=None
+    ) != task_identifier(resolved_tasks[1], GenerateConfig(), eval_set_solver=None)
+    run_eval_set(resolved_tasks)
+
+
+def test_task_identifier_with_model_roles_model_configs():
+    # ensure that model roles with different configs produce different task identifiers
+    model1 = get_model("mockllm/model")
+    model2 = get_model("mockllm/model", config=GenerateConfig(temperature=0))
+    task1 = hello_world()
+    task2 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+        model_roles={"scorer": model1},
+    )
+    task_with(
+        task2,
+        model=model1,
+        model_roles={"scorer": model2},
+    )
+    resolved_tasks = resolve_tasks([task1, task2], {}, model1, None, None, None)
+
+    assert task_identifier(
+        resolved_tasks[0], GenerateConfig(), eval_set_solver=None
+    ) != task_identifier(resolved_tasks[1], GenerateConfig(), eval_set_solver=None)
+    run_eval_set(resolved_tasks)
+
+
+def test_task_identifier_with_task_generate_configs():
+    model1 = get_model("mockllm/model")
+    task1 = hello_world()
+    task2 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+        config=GenerateConfig(temperature=0.0),
+        model_roles={"scorer": model1},
+    )
+    task_with(
+        task2,
+        model=model1,
+        config=GenerateConfig(temperature=0.5),
+        model_roles={"scorer": model1},
+    )
+    resolved_tasks = resolve_tasks([task1, task2], {}, model1, None, None, None)
+    assert task_identifier(
+        resolved_tasks[0], GenerateConfig(), eval_set_solver=None
+    ) != task_identifier(resolved_tasks[1], GenerateConfig(), eval_set_solver=None)
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        config = GenerateConfig(temperature=0.7)
+        # Since eval_set config overrides the task config, both tasks will be the same and this should raise an error
+        with pytest.raises(PrerequisiteError):
+            eval_set(
+                tasks=[task1, task2],
+                log_dir=log_dir,
+                model="mockllm/model",
+                **config.model_dump(),
+            )
+
+    # system_message will not override the value set in the task config, so these tasks will still be unique
+    run_eval_set(
+        resolved_tasks, config=GenerateConfig(system_message="Test System Message")
+    )
+
+
+def test_task_identifier_with_solvers():
+    # test that tasks with different solvers produce different task identifiers
+    model1 = get_model("mockllm/model")
+    task1 = hello_world()
+    task2 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+    )
+    task_with(
+        task2,
+        model=model1,
+        solver=[identity_solver(2)],
+    )
+    resolved_tasks = resolve_tasks([task1, task2], {}, model1, None, None, None)
+    assert task_identifier(
+        resolved_tasks[0], GenerateConfig(), eval_set_solver=None
+    ) != task_identifier(resolved_tasks[1], GenerateConfig(), eval_set_solver=None)
+    run_eval_set(resolved_tasks)
+
+
+def test_task_identifier_with_solver_arg():
+    # test that tasks with different solvers produce different task identifiers
+    model1 = get_model("mockllm/model")
+    task1 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+    )
+    id5 = identity_solver(5)
+    resolved_tasks = resolve_tasks([task1], {}, model1, None, None, None)
+    run_eval_set(resolved_tasks, solver=id5)
+
+
+def test_task_identifier_with_model_args():
+    model1 = get_model("mockllm/model", max_tokens=100)
+    model2 = get_model("mockllm/model", max_tokens=200)
+    task1 = hello_world()
+    task2 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+    )
+    task_with(
+        task2,
+        model=model2,
+    )
+    resolved_tasks = resolve_tasks([task1, task2], {}, model1, None, None, None)
+
+    assert task_identifier(
+        resolved_tasks[0], GenerateConfig(), eval_set_solver=None
+    ) != task_identifier(resolved_tasks[1], GenerateConfig(), eval_set_solver=None)
+    run_eval_set(resolved_tasks)
+
+
+def test_task_identifier_with_model_args_arg():
+    model1 = get_model("mockllm/model", max_tokens=100)
+    task1 = hello_world()
+    task2 = hello_world()
+    task_with(task1, model=model1)
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        eval_set(
+            tasks=[task1, task2],
+            log_dir=log_dir,
+            model="mockllm/model",
+            model_args={"max_tokens": 200},
+        )
+
+        all_logs = list_all_eval_logs(log_dir)
+        assert len(all_logs) == 2
+
+        eval_set(
+            tasks=[task1, task2],
+            log_dir=log_dir,
+            model="mockllm/model",
+            model_args={"max_tokens": 200},
+        )
+
+        all_logs = list_all_eval_logs(log_dir)
+        assert len(all_logs) == 2
+
+
+def resolved_tasks_have_unique_identifiers(resolved_tasks: list[ResolvedTask]) -> bool:
+    identifiers = set()
+    for resolved_task in resolved_tasks:
+        identifier = task_identifier(
+            resolved_task, GenerateConfig(), eval_set_solver=None
+        )
+        if identifier in identifiers:
+            return False
+        identifiers.add(identifier)
+    return True
+
+
+def test_task_identifier_with_task_versions():
+    model1 = get_model("mockllm/model")
+    task1 = hello_world()
+    task2 = hello_world()
+    task3 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+        version=1,
+    )
+    task_with(
+        task2,
+        model=model1,
+        version="1",
+    )
+    task_with(
+        task3,
+        model=model1,
+        version=2,
+    )
+    resolved_tasks = resolve_tasks([task1, task2, task3], {}, model1, None, None, None)
+    assert resolved_tasks_have_unique_identifiers(resolved_tasks)
+    run_eval_set(resolved_tasks)
+
+
+def test_task_identifier_with_task_limits():
+    model1 = get_model("mockllm/model")
+    task1 = hello_world()
+    task2 = hello_world()
+    task3 = hello_world()
+    task4 = hello_world()
+    task5 = hello_world()
+    task_with(
+        task1,
+        model=model1,
+    )
+    task_with(
+        task2,
+        model=model1,
+        message_limit=10,
+    )
+    task_with(
+        task3,
+        model=model1,
+        token_limit=100,
+    )
+    task_with(
+        task4,
+        model=model1,
+        time_limit=5,
+    )
+    task_with(
+        task5,
+        model=model1,
+        working_limit=60,
+    )
+    resolved_tasks = resolve_tasks(
+        [task1, task2, task3, task4, task5], {}, model1, None, None, None
+    )
+    assert resolved_tasks_have_unique_identifiers(resolved_tasks)
+    run_eval_set(resolved_tasks)
+
+
+def verify_logs(
+    logs: list[EvalLog], log_dir: str, tasks: int = 1, samples: int = 1, epochs: int = 1
+):
+    all_logs = list_all_eval_logs(log_dir)
+    assert len(all_logs) == tasks
+
+    for log in logs:
+        assert log.eval.config.epochs == epochs
+        log_with_samples = read_eval_log(log.location)
+        assert log_with_samples.samples is not None
+        assert len(log_with_samples.samples) == epochs * samples
+
+
+def test_eval_set_epochs_changed():
+    task1 = hello_world()
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            epochs=1,
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=1)
+
+        # Rerunning the same should not generate a new log file
+        # Mock iso_now to return a different timestamp to ensure we'd get a new log if one was created
+        location = logs[0].location
+
+        with patch("inspect_ai._eval.task.log.iso_now") as mock_iso_now:
+            mock_iso_now.return_value = "2024-01-01T00:00:01"
+            [result, logs] = eval_set(
+                tasks=[task1],
+                log_dir=log_dir,
+                model="mockllm/model",
+                epochs=1,
+            )
+            assert result
+            verify_logs(logs, log_dir, epochs=1)
+            assert basename(logs[0].location) == basename(location)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            epochs=2,
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=2)
+
+        task_with(task1, epochs=3)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=3)
+
+        size_before = size_in_mb(logs[0].location)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            epochs=1,
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=1)
+
+        assert size_in_mb(logs[0].location) < size_before
+
+        # Calling eval_set with epochs=1 modifies the task so need to reset to 3
+        task_with(task1, epochs=3)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=3)
+
+        task_with(task1, epochs=2)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=2)
+
+
+def test_eval_set_epochs_changed_to_none():
+    task1 = hello_world()
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            epochs=3,
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=3)
+
+        task_with(task1, epochs=None)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+        )
+        assert result
+        verify_logs(logs, log_dir, epochs=1)
+
+
+def test_eval_set_limit_changed():
+    task1 = hello_world(samples=10)
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=1,
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=1)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=5,
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=5)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=10)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=1,
+        )
+        assert result
+        # reducing limit does not remove samples
+        verify_logs(logs, log_dir, samples=10)
+
+
+def test_eval_set_limit_slices():
+    task1 = hello_world(samples=10)
+
+    with tempfile.TemporaryDirectory() as log_dir:
+        # start off the end
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=(10, 11),
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=0)
+
+        # stop off the end
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=(9, 11),
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=1)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=(3, 6),
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=3)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+        )
+        assert result
+        verify_logs(logs, log_dir, samples=10)
+
+        [result, logs] = eval_set(
+            tasks=[task1],
+            log_dir=log_dir,
+            model="mockllm/model",
+            limit=(3, 6),
+        )
+        assert result
+        # reducing limit does not remove samples
+        verify_logs(logs, log_dir, samples=10)
+
+
+def test_invalidation(tmp_path: Path):
+    @task
+    def task_for_invalidation():
+        return Task(
+            dataset=[
+                Sample(input=f"Just reply with {idx_sample}", target="Hello World")
+                for idx_sample in range(10)
+            ],
+            solver=[generate()],
+            scorer=exact(),
+        )
+
+    task1 = task_for_invalidation()
+    task2 = task_with(task_for_invalidation(), model=get_model("mockllm/model2"))
+
+    def run_eval_set():
+        return eval_set(
+            tasks=[task1, task2],
+            log_dir=str(tmp_path),
+            retry_attempts=0,
+            retry_cleanup=False,
+            model="mockllm/model",
+        )
+
+    success, (eval1, eval2) = run_eval_set()
+    assert success
+    assert eval1.status == "success"
+    assert eval2.status == "success"
+    assert len(list(tmp_path.glob("*.eval"))) == 2
+
+    eval1 = read_eval_log(eval1.location)
+    samples = eval1.samples
+    assert samples is not None
+    sample = samples[0]
+    assert sample.uuid is not None
+    invalidated_sample = sample.uuid
+    eval1 = invalidate_samples(
+        eval1,
+        sample_uuids=[invalidated_sample],
+        provenance=ProvenanceData(author="test_person", reason="test_reason"),
+    )
+    write_eval_log(eval1, location=eval1.location)
+
+    # Mock iso_now to ensure we get a new eval log filename
+    with patch("inspect_ai._eval.task.log.iso_now") as mock_iso_now:
+        mock_iso_now.return_value = "2024-01-01T00:00:02"
+        success2, evals_retried = run_eval_set()
+    assert success2
+    eval1_retried = next(
+        eval for eval in evals_retried if eval.eval.task_id == eval1.eval.task_id
+    )
+    assert eval1_retried.status == "success"
+    assert eval1_retried.eval.eval_id != eval1.eval.eval_id
+    eval1_retried = read_eval_log(eval1_retried.location)
+
+    new_sample_uuids = {sample.uuid for sample in eval1_retried.samples or []}
+    old_sample_uuids = {sample.uuid for sample in eval1.samples or []}
+    assert len(new_sample_uuids) == len(old_sample_uuids)
+    assert new_sample_uuids != old_sample_uuids
+    reused_sample_uuids = old_sample_uuids.intersection(new_sample_uuids)
+    assert reused_sample_uuids == old_sample_uuids - {invalidated_sample}

@@ -30,7 +30,7 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
   const event = eventNode.event;
 
   // Extract tool input
-  const { input, functionCall, highlightLanguage } = useMemo(
+  const { input, description, functionCall, contentType } = useMemo(
     () => resolveToolInput(event.function, event.arguments),
     [event.function, event.arguments],
   );
@@ -50,7 +50,7 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
       approvalNode: approvalNode as EventNode<ApprovalEvent> | undefined,
       lastModelNode: lastModelNode as EventNode<ModelEvent> | undefined,
     };
-  }, [event.events]);
+  }, [children]);
 
   const title = `Tool: ${event.view?.title || event.function}`;
   return (
@@ -69,7 +69,8 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
           id={`${eventNode.id}-tool-call`}
           functionCall={functionCall}
           input={input}
-          highlightLanguage={highlightLanguage}
+          description={description}
+          contentType={contentType}
           output={event.error?.message || event.result}
           mode="compact"
           view={event.view ? event.view : undefined}
@@ -81,6 +82,7 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
             messages={lastModelNode.event.output.choices.map((m) => m.message)}
             numbered={false}
             toolCallStyle="compact"
+            allowLinking={false}
           />
         ) : undefined}
 

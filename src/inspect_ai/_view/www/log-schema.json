@@ -212,6 +212,18 @@
           "default": null,
           "title": "Size"
         },
+        "max_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Size"
+        },
         "send_delay": {
           "anyOf": [
             {
@@ -247,15 +259,66 @@
           ],
           "default": null,
           "title": "Max Batches"
+        },
+        "max_consecutive_check_failures": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Consecutive Check Failures"
         }
       },
       "title": "BatchConfig",
       "type": "object",
       "required": [
         "size",
+        "max_size",
         "send_delay",
         "tick",
-        "max_batches"
+        "max_batches",
+        "max_consecutive_check_failures"
+      ],
+      "additionalProperties": false
+    },
+    "CachePolicy": {
+      "description": "Caching options for model generation.",
+      "properties": {
+        "expiry": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "1W",
+          "title": "Expiry"
+        },
+        "per_epoch": {
+          "default": true,
+          "title": "Per Epoch",
+          "type": "boolean"
+        },
+        "scopes": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Scopes",
+          "type": "object"
+        }
+      },
+      "title": "CachePolicy",
+      "type": "object",
+      "required": [
+        "expiry",
+        "per_epoch",
+        "scopes"
       ],
       "additionalProperties": false
     },
@@ -339,6 +402,12 @@
                   },
                   {
                     "$ref": "#/$defs/ContentData"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentToolUse"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentDocument"
                   }
                 ]
               },
@@ -375,17 +444,6 @@
           ],
           "default": null,
           "title": "Metadata"
-        },
-        "internal": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
         },
         "role": {
           "const": "assistant",
@@ -426,7 +484,6 @@
         "content",
         "source",
         "metadata",
-        "internal",
         "role",
         "tool_calls",
         "model"
@@ -475,6 +532,12 @@
                   },
                   {
                     "$ref": "#/$defs/ContentData"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentToolUse"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentDocument"
                   }
                 ]
               },
@@ -512,17 +575,6 @@
           "default": null,
           "title": "Metadata"
         },
-        "internal": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "role": {
           "const": "system",
           "default": "system",
@@ -535,7 +587,6 @@
         "content",
         "source",
         "metadata",
-        "internal",
         "role"
       ],
       "title": "ChatMessageSystem",
@@ -582,6 +633,12 @@
                   },
                   {
                     "$ref": "#/$defs/ContentData"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentToolUse"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentDocument"
                   }
                 ]
               },
@@ -618,17 +675,6 @@
           ],
           "default": null,
           "title": "Metadata"
-        },
-        "internal": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
         },
         "role": {
           "const": "tool",
@@ -677,7 +723,6 @@
         "content",
         "source",
         "metadata",
-        "internal",
         "role",
         "tool_call_id",
         "function",
@@ -727,6 +772,12 @@
                   },
                   {
                     "$ref": "#/$defs/ContentData"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentToolUse"
+                  },
+                  {
+                    "$ref": "#/$defs/ContentDocument"
                   }
                 ]
               },
@@ -764,17 +815,6 @@
           "default": null,
           "title": "Metadata"
         },
-        "internal": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "role": {
           "const": "user",
           "default": "user",
@@ -802,7 +842,6 @@
         "content",
         "source",
         "metadata",
-        "internal",
         "role",
         "tool_call_id"
       ],
@@ -862,15 +901,9 @@
               "type": "string"
             },
             {
-              "additionalItems": false,
-              "items": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "integer"
-                }
-              ],
+              "items": {
+                "type": "integer"
+              },
               "maxItems": 2,
               "minItems": 2,
               "type": "array"
@@ -963,6 +996,50 @@
       "type": "object",
       "additionalProperties": false
     },
+    "ContentDocument": {
+      "description": "Document content (e.g. a PDF).",
+      "properties": {
+        "internal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "type": {
+          "const": "document",
+          "default": "document",
+          "title": "Type",
+          "type": "string"
+        },
+        "document": {
+          "title": "Document",
+          "type": "string"
+        },
+        "filename": {
+          "title": "Filename",
+          "type": "string"
+        },
+        "mime_type": {
+          "title": "Mime Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "internal",
+        "type",
+        "document",
+        "filename",
+        "mime_type"
+      ],
+      "title": "ContentDocument",
+      "type": "object",
+      "additionalProperties": false
+    },
     "ContentImage": {
       "description": "Image content.",
       "properties": {
@@ -1032,6 +1109,18 @@
           "title": "Reasoning",
           "type": "string"
         },
+        "summary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Summary"
+        },
         "signature": {
           "anyOf": [
             {
@@ -1054,6 +1143,7 @@
         "internal",
         "type",
         "reasoning",
+        "summary",
         "signature",
         "redacted"
       ],
@@ -1142,6 +1232,91 @@
       "type": "object",
       "additionalProperties": false
     },
+    "ContentToolUse": {
+      "description": "Server side tool use.",
+      "properties": {
+        "internal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "type": {
+          "const": "tool_use",
+          "default": "tool_use",
+          "title": "Type",
+          "type": "string"
+        },
+        "tool_type": {
+          "enum": [
+            "web_search",
+            "mcp_call",
+            "code_execution"
+          ],
+          "title": "Tool Type",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "context": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context"
+        },
+        "arguments": {
+          "title": "Arguments",
+          "type": "string"
+        },
+        "result": {
+          "title": "Result",
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        }
+      },
+      "required": [
+        "internal",
+        "type",
+        "tool_type",
+        "id",
+        "name",
+        "context",
+        "arguments",
+        "result",
+        "error"
+      ],
+      "title": "ContentToolUse",
+      "type": "object",
+      "additionalProperties": false
+    },
     "ContentVideo": {
       "description": "Video content.",
       "properties": {
@@ -1195,15 +1370,9 @@
               "type": "string"
             },
             {
-              "additionalItems": false,
-              "items": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "integer"
-                }
-              ],
+              "items": {
+                "type": "integer"
+              },
               "maxItems": 2,
               "minItems": 2,
               "type": "array"
@@ -1298,6 +1467,93 @@
         "end_index"
       ],
       "title": "DocumentRange",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "EarlyStop": {
+      "description": "Directive to stop a sample early.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            }
+          ],
+          "title": "Id"
+        },
+        "epoch": {
+          "title": "Epoch",
+          "type": "integer"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonValue"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metadata"
+        }
+      },
+      "required": [
+        "id",
+        "epoch",
+        "reason",
+        "metadata"
+      ],
+      "title": "EarlyStop",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "EarlyStoppingSummary": {
+      "description": "Summary of early stopping applied to task.",
+      "properties": {
+        "manager": {
+          "title": "Manager",
+          "type": "string"
+        },
+        "early_stops": {
+          "items": {
+            "$ref": "#/$defs/EarlyStop"
+          },
+          "title": "Early Stops",
+          "type": "array"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Metadata",
+          "type": "object"
+        }
+      },
+      "required": [
+        "manager",
+        "early_stops",
+        "metadata"
+      ],
+      "title": "EarlyStoppingSummary",
       "type": "object",
       "additionalProperties": false
     },
@@ -1454,6 +1710,21 @@
           "default": null,
           "title": "Sample Id"
         },
+        "sample_shuffle": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sample Shuffle"
+        },
         "epochs": {
           "anyOf": [
             {
@@ -1506,6 +1777,18 @@
           ],
           "default": null,
           "title": "Fail On Error"
+        },
+        "continue_on_fail": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Continue On Fail"
         },
         "retry_on_error": {
           "anyOf": [
@@ -1705,10 +1988,12 @@
       "required": [
         "limit",
         "sample_id",
+        "sample_shuffle",
         "epochs",
         "epochs_reducer",
         "approval",
         "fail_on_error",
+        "continue_on_fail",
         "retry_on_error",
         "message_limit",
         "token_limit",
@@ -1925,44 +2210,6 @@
       "type": "object",
       "additionalProperties": false
     },
-    "EvalModelConfig": {
-      "description": "Model config.",
-      "properties": {
-        "model": {
-          "title": "Model",
-          "type": "string"
-        },
-        "config": {
-          "$ref": "#/$defs/GenerateConfig"
-        },
-        "base_url": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Base Url"
-        },
-        "args": {
-          "additionalProperties": true,
-          "title": "Args",
-          "type": "object"
-        }
-      },
-      "required": [
-        "model",
-        "config",
-        "base_url",
-        "args"
-      ],
-      "title": "EvalModelConfig",
-      "type": "object",
-      "additionalProperties": false
-    },
     "EvalPlan": {
       "description": "Plan (solvers) used in evaluation.",
       "properties": {
@@ -1995,6 +2242,7 @@
           "default": {
             "max_retries": null,
             "timeout": null,
+            "attempt_timeout": null,
             "max_connections": null,
             "system_message": null,
             "max_tokens": null,
@@ -2014,12 +2262,15 @@
             "internal_tools": null,
             "max_tool_output": null,
             "cache_prompt": null,
+            "verbosity": null,
+            "effort": null,
             "reasoning_effort": null,
             "reasoning_tokens": null,
             "reasoning_summary": null,
             "reasoning_history": null,
             "response_schema": null,
             "extra_body": null,
+            "cache": null,
             "batch": null
           }
         }
@@ -2045,11 +2296,17 @@
           "additionalProperties": true,
           "title": "Params",
           "type": "object"
+        },
+        "params_passed": {
+          "additionalProperties": true,
+          "title": "Params Passed",
+          "type": "object"
         }
       },
       "required": [
         "solver",
-        "params"
+        "params",
+        "params_passed"
       ],
       "title": "EvalPlanStep",
       "type": "object",
@@ -2067,6 +2324,17 @@
           "default": 0,
           "title": "Completed Samples",
           "type": "integer"
+        },
+        "early_stopping": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EarlyStoppingSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "scores": {
           "default": [],
@@ -2095,6 +2363,7 @@
       "required": [
         "total_samples",
         "completed_samples",
+        "early_stopping",
         "scores",
         "metadata"
       ],
@@ -2115,12 +2384,25 @@
         "commit": {
           "title": "Commit",
           "type": "string"
+        },
+        "dirty": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dirty"
         }
       },
       "required": [
         "type",
         "origin",
-        "commit"
+        "commit",
+        "dirty"
       ],
       "title": "EvalRevision",
       "type": "object",
@@ -2320,6 +2602,9 @@
                 "$ref": "#/$defs/ScoreEvent"
               },
               {
+                "$ref": "#/$defs/ScoreEditEvent"
+              },
+              {
                 "$ref": "#/$defs/ErrorEvent"
               },
               {
@@ -2351,6 +2636,30 @@
           },
           "title": "Model Usage",
           "type": "object"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started At"
+        },
+        "completed_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Completed At"
         },
         "total_time": {
           "anyOf": [
@@ -2387,6 +2696,17 @@
           ],
           "default": null,
           "title": "Uuid"
+        },
+        "invalidation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProvenanceData"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "error": {
           "anyOf": [
@@ -2449,9 +2769,12 @@
         "store",
         "events",
         "model_usage",
+        "started_at",
+        "completed_at",
         "total_time",
         "working_time",
         "uuid",
+        "invalidation",
         "error",
         "error_retries",
         "attachments",
@@ -2624,6 +2947,13 @@
           "default": null,
           "title": "Metadata"
         },
+        "history": {
+          "items": {
+            "$ref": "#/$defs/ScoreEdit"
+          },
+          "title": "History",
+          "type": "array"
+        },
         "sample_id": {
           "anyOf": [
             {
@@ -2645,6 +2975,7 @@
         "answer",
         "explanation",
         "metadata",
+        "history",
         "sample_id"
       ],
       "title": "EvalSampleScore",
@@ -2821,6 +3152,18 @@
     "EvalSpec": {
       "description": "Eval target and configuration.",
       "properties": {
+        "eval_set_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Eval Set Id"
+        },
         "eval_id": {
           "title": "Eval Id",
           "type": "string"
@@ -2864,6 +3207,18 @@
           ],
           "default": null,
           "title": "Task File"
+        },
+        "task_display_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Display Name"
         },
         "task_registry_name": {
           "anyOf": [
@@ -2916,6 +3271,19 @@
           ],
           "default": null,
           "title": "Solver Args"
+        },
+        "solver_args_passed": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Solver Args Passed"
         },
         "tags": {
           "anyOf": [
@@ -2974,7 +3342,7 @@
           "anyOf": [
             {
               "additionalProperties": {
-                "$ref": "#/$defs/EvalModelConfig"
+                "$ref": "#/$defs/ModelConfig"
               },
               "type": "object"
             },
@@ -3038,7 +3406,20 @@
           "anyOf": [
             {
               "items": {
-                "$ref": "#/$defs/EvalMetricDefinition"
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/EvalMetricDefinition"
+                  },
+                  {
+                    "additionalProperties": {
+                      "items": {
+                        "$ref": "#/$defs/EvalMetricDefinition"
+                      },
+                      "type": "array"
+                    },
+                    "type": "object"
+                  }
+                ]
               },
               "type": "array"
             },
@@ -3060,6 +3441,7 @@
         }
       },
       "required": [
+        "eval_set_id",
         "eval_id",
         "run_id",
         "created",
@@ -3067,12 +3449,14 @@
         "task_id",
         "task_version",
         "task_file",
+        "task_display_name",
         "task_registry_name",
         "task_attribs",
         "task_args",
         "task_args_passed",
         "solver",
         "solver_args",
+        "solver_args_passed",
         "tags",
         "dataset",
         "sandbox",
@@ -3096,12 +3480,28 @@
       "description": "Timing and usage statistics.",
       "properties": {
         "started_at": {
-          "title": "Started At",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "const": "",
+              "type": "string"
+            }
+          ],
+          "title": "Started At"
         },
         "completed_at": {
-          "title": "Completed At",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "const": "",
+              "type": "string"
+            }
+          ],
+          "title": "Completed At"
         },
         "model_usage": {
           "additionalProperties": {
@@ -3146,6 +3546,18 @@
           ],
           "default": null,
           "title": "Timeout"
+        },
+        "attempt_timeout": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt Timeout"
         },
         "max_connections": {
           "anyOf": [
@@ -3385,13 +3797,50 @@
           "default": null,
           "title": "Cache Prompt"
         },
-        "reasoning_effort": {
+        "verbosity": {
           "anyOf": [
             {
               "enum": [
                 "low",
                 "medium",
                 "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verbosity"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
               ],
               "type": "string"
             },
@@ -3418,6 +3867,7 @@
           "anyOf": [
             {
               "enum": [
+                "none",
                 "concise",
                 "detailed",
                 "auto"
@@ -3473,6 +3923,21 @@
           "default": null,
           "title": "Extra Body"
         },
+        "cache": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "$ref": "#/$defs/CachePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache"
+        },
         "batch": {
           "anyOf": [
             {
@@ -3497,6 +3962,7 @@
       "required": [
         "max_retries",
         "timeout",
+        "attempt_timeout",
         "max_connections",
         "system_message",
         "max_tokens",
@@ -3516,12 +3982,15 @@
         "internal_tools",
         "max_tool_output",
         "cache_prompt",
+        "verbosity",
+        "effort",
         "reasoning_effort",
         "reasoning_tokens",
         "reasoning_summary",
         "reasoning_history",
         "response_schema",
         "extra_body",
+        "cache",
         "batch"
       ],
       "additionalProperties": false
@@ -3731,6 +4200,21 @@
                 "null"
               ],
               "type": "string"
+            },
+            {
+              "items": {
+                "enum": [
+                  "string",
+                  "integer",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object",
+                  "null"
+                ],
+                "type": "string"
+              },
+              "type": "array"
             },
             {
               "type": "null"
@@ -4180,6 +4664,44 @@
       "type": "object",
       "additionalProperties": false
     },
+    "ModelConfig": {
+      "description": "Model config.",
+      "properties": {
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "config": {
+          "$ref": "#/$defs/GenerateConfig"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "args": {
+          "additionalProperties": true,
+          "title": "Args",
+          "type": "object"
+        }
+      },
+      "required": [
+        "model",
+        "config",
+        "base_url",
+        "args"
+      ],
+      "title": "ModelConfig",
+      "type": "object",
+      "additionalProperties": false
+    },
     "ModelEvent": {
       "description": "Call to a language model.",
       "properties": {
@@ -4430,6 +4952,11 @@
           "title": "Choices",
           "type": "array"
         },
+        "completion": {
+          "default": "",
+          "title": "Completion",
+          "type": "string"
+        },
         "usage": {
           "anyOf": [
             {
@@ -4484,6 +5011,7 @@
       "required": [
         "model",
         "choices",
+        "completion",
         "usage",
         "time",
         "metadata",
@@ -4556,6 +5084,46 @@
         "input_tokens_cache_read",
         "reasoning_tokens"
       ],
+      "additionalProperties": false
+    },
+    "ProvenanceData": {
+      "description": "Metadata about who made an edit and why.",
+      "properties": {
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "author": {
+          "title": "Author",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        }
+      },
+      "required": [
+        "timestamp",
+        "author",
+        "reason",
+        "metadata"
+      ],
+      "title": "ProvenanceData",
+      "type": "object",
       "additionalProperties": false
     },
     "ResponseSchema": {
@@ -5247,15 +5815,248 @@
           ],
           "default": null,
           "title": "Metadata"
+        },
+        "history": {
+          "items": {
+            "$ref": "#/$defs/ScoreEdit"
+          },
+          "title": "History",
+          "type": "array"
         }
       },
       "required": [
         "value",
         "answer",
         "explanation",
-        "metadata"
+        "metadata",
+        "history"
       ],
       "title": "Score",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ScoreEdit": {
+      "description": "A single edit to a score.",
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "const": "UNCHANGED",
+              "type": "string"
+            }
+          ],
+          "default": "UNCHANGED",
+          "title": "Value"
+        },
+        "answer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "const": "UNCHANGED",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "UNCHANGED",
+          "title": "Answer"
+        },
+        "explanation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "const": "UNCHANGED",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "UNCHANGED",
+          "title": "Explanation"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "const": "UNCHANGED",
+              "type": "string"
+            }
+          ],
+          "default": "UNCHANGED",
+          "title": "Metadata"
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProvenanceData"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ScoreEdit",
+      "type": "object",
+      "required": [
+        "value",
+        "answer",
+        "explanation",
+        "metadata",
+        "provenance"
+      ],
+      "additionalProperties": false
+    },
+    "ScoreEditEvent": {
+      "description": "Event recorded when a score is edited.",
+      "properties": {
+        "uuid": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uuid"
+        },
+        "span_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Span Id"
+        },
+        "timestamp": {
+          "format": "date-time",
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "working_start": {
+          "title": "Working Start",
+          "type": "number"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metadata"
+        },
+        "pending": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pending"
+        },
+        "event": {
+          "const": "score_edit",
+          "default": "score_edit",
+          "title": "Event",
+          "type": "string"
+        },
+        "score_name": {
+          "title": "Score Name",
+          "type": "string"
+        },
+        "edit": {
+          "$ref": "#/$defs/ScoreEdit"
+        }
+      },
+      "required": [
+        "uuid",
+        "span_id",
+        "timestamp",
+        "working_start",
+        "metadata",
+        "pending",
+        "event",
+        "score_name",
+        "edit"
+      ],
+      "title": "ScoreEditEvent",
       "type": "object",
       "additionalProperties": false
     },
@@ -5951,61 +6752,7 @@
           "title": "Result"
         },
         "events": {
-          "items": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/SampleInitEvent"
-              },
-              {
-                "$ref": "#/$defs/SampleLimitEvent"
-              },
-              {
-                "$ref": "#/$defs/SandboxEvent"
-              },
-              {
-                "$ref": "#/$defs/StateEvent"
-              },
-              {
-                "$ref": "#/$defs/StoreEvent"
-              },
-              {
-                "$ref": "#/$defs/ModelEvent"
-              },
-              {
-                "$ref": "#/$defs/ToolEvent"
-              },
-              {
-                "$ref": "#/$defs/ApprovalEvent"
-              },
-              {
-                "$ref": "#/$defs/InputEvent"
-              },
-              {
-                "$ref": "#/$defs/ScoreEvent"
-              },
-              {
-                "$ref": "#/$defs/ErrorEvent"
-              },
-              {
-                "$ref": "#/$defs/LoggerEvent"
-              },
-              {
-                "$ref": "#/$defs/InfoEvent"
-              },
-              {
-                "$ref": "#/$defs/SpanBeginEvent"
-              },
-              {
-                "$ref": "#/$defs/SpanEndEvent"
-              },
-              {
-                "$ref": "#/$defs/StepEvent"
-              },
-              {
-                "$ref": "#/$defs/SubtaskEvent"
-              }
-            ]
-          },
+          "items": {},
           "title": "Events",
           "type": "array"
         },
@@ -6070,17 +6817,6 @@
           "title": "Arguments",
           "type": "object"
         },
-        "internal": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "parse_error": {
           "anyOf": [
             {
@@ -6105,23 +6841,19 @@
           "default": null
         },
         "type": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
+          "default": "function",
+          "enum": [
+            "function",
+            "custom"
           ],
-          "default": null,
-          "title": "Type"
+          "title": "Type",
+          "type": "string"
         }
       },
       "required": [
         "id",
         "function",
         "arguments",
-        "internal",
         "parse_error",
         "view",
         "type"
@@ -6320,17 +7052,6 @@
           "title": "Arguments",
           "type": "object"
         },
-        "internal": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "view": {
           "anyOf": [
             {
@@ -6360,9 +7081,6 @@
               "$ref": "#/$defs/ContentText"
             },
             {
-              "$ref": "#/$defs/ContentReasoning"
-            },
-            {
               "$ref": "#/$defs/ContentImage"
             },
             {
@@ -6372,16 +7090,10 @@
               "$ref": "#/$defs/ContentVideo"
             },
             {
-              "$ref": "#/$defs/ContentData"
-            },
-            {
               "items": {
                 "anyOf": [
                   {
                     "$ref": "#/$defs/ContentText"
-                  },
-                  {
-                    "$ref": "#/$defs/ContentReasoning"
                   },
                   {
                     "$ref": "#/$defs/ContentImage"
@@ -6391,9 +7103,6 @@
                   },
                   {
                     "$ref": "#/$defs/ContentVideo"
-                  },
-                  {
-                    "$ref": "#/$defs/ContentData"
                   }
                 ]
               },
@@ -6436,61 +7145,7 @@
           "default": null
         },
         "events": {
-          "items": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/SampleInitEvent"
-              },
-              {
-                "$ref": "#/$defs/SampleLimitEvent"
-              },
-              {
-                "$ref": "#/$defs/SandboxEvent"
-              },
-              {
-                "$ref": "#/$defs/StateEvent"
-              },
-              {
-                "$ref": "#/$defs/StoreEvent"
-              },
-              {
-                "$ref": "#/$defs/ModelEvent"
-              },
-              {
-                "$ref": "#/$defs/ToolEvent"
-              },
-              {
-                "$ref": "#/$defs/ApprovalEvent"
-              },
-              {
-                "$ref": "#/$defs/InputEvent"
-              },
-              {
-                "$ref": "#/$defs/ScoreEvent"
-              },
-              {
-                "$ref": "#/$defs/ErrorEvent"
-              },
-              {
-                "$ref": "#/$defs/LoggerEvent"
-              },
-              {
-                "$ref": "#/$defs/InfoEvent"
-              },
-              {
-                "$ref": "#/$defs/SpanBeginEvent"
-              },
-              {
-                "$ref": "#/$defs/SpanEndEvent"
-              },
-              {
-                "$ref": "#/$defs/StepEvent"
-              },
-              {
-                "$ref": "#/$defs/SubtaskEvent"
-              }
-            ]
-          },
+          "items": {},
           "title": "Events",
           "type": "array"
         },
@@ -6568,7 +7223,6 @@
         "id",
         "function",
         "arguments",
-        "internal",
         "view",
         "result",
         "truncated",
@@ -6660,9 +7314,19 @@
           "type": "array"
         },
         "additionalProperties": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JSONSchema"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": false,
-          "title": "Additionalproperties",
-          "type": "boolean"
+          "title": "Additionalproperties"
         }
       },
       "title": "ToolParams",
@@ -6720,15 +7384,9 @@
               "type": "string"
             },
             {
-              "additionalItems": false,
-              "items": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "integer"
-                }
-              ],
+              "items": {
+                "type": "integer"
+              },
               "maxItems": 2,
               "minItems": 2,
               "type": "array"
@@ -6788,6 +7446,186 @@
       "title": "UrlCitation",
       "type": "object",
       "additionalProperties": false
+    },
+    "EvalSetInfo": {
+      "$defs": {
+        "EvalSetTask": {
+          "properties": {
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "task_id": {
+              "title": "Task Id",
+              "type": "string"
+            },
+            "task_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Task File"
+            },
+            "task_args": {
+              "additionalProperties": true,
+              "title": "Task Args",
+              "type": "object"
+            },
+            "model": {
+              "title": "Model",
+              "type": "string"
+            },
+            "model_args": {
+              "additionalProperties": true,
+              "title": "Model Args",
+              "type": "object"
+            },
+            "model_roles": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Model Roles"
+            },
+            "sequence": {
+              "title": "Sequence",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "task_id",
+            "task_file",
+            "task_args",
+            "model",
+            "model_args",
+            "model_roles",
+            "sequence"
+          ],
+          "title": "EvalSetTask",
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "properties": {
+        "eval_set_id": {
+          "title": "Eval Set Id",
+          "type": "string"
+        },
+        "tasks": {
+          "items": {
+            "$ref": "#/$defs/EvalSetTask"
+          },
+          "title": "Tasks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "eval_set_id",
+        "tasks"
+      ],
+      "title": "EvalSet",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "EvalSetTask": {
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        },
+        "task_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task File"
+        },
+        "task_args": {
+          "additionalProperties": true,
+          "title": "Task Args",
+          "type": "object"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "model_args": {
+          "additionalProperties": true,
+          "title": "Model Args",
+          "type": "object"
+        },
+        "model_roles": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Roles"
+        },
+        "sequence": {
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "task_id",
+        "task_file",
+        "task_args",
+        "model",
+        "model_args",
+        "model_roles",
+        "sequence"
+      ],
+      "title": "EvalSetTask",
+      "type": "object",
+      "additionalProperties": false
     }
   },
   "description": "Evaluation log.",
@@ -6839,6 +7677,11 @@
       ],
       "default": null
     },
+    "invalidated": {
+      "default": false,
+      "title": "Invalidated",
+      "type": "boolean"
+    },
     "samples": {
       "anyOf": [
         {
@@ -6872,6 +7715,29 @@
     "location": {
       "title": "Location",
       "type": "string"
+    },
+    "etag": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Etag"
+    },
+    "eval_set_info": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EvalSetInfo"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

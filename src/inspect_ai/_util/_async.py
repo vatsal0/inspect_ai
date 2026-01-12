@@ -3,13 +3,11 @@ import inspect
 import os
 import sys
 from logging import Logger
-from typing import Any, Awaitable, Callable, Coroutine, Literal, TypeVar, cast
+from typing import Any, Awaitable, Callable, Coroutine, Iterable, Literal, TypeVar, cast
 
 import anyio
-import nest_asyncio  # type: ignore
+import nest_asyncio2 as nest_asyncio  # type: ignore
 import sniffio
-
-from inspect_ai._util.eval_task_group import eval_task_group
 
 if sys.version_info >= (3, 11):
     from typing import TypeVarTuple, Unpack
@@ -24,8 +22,12 @@ PosArgsT = TypeVarTuple("PosArgsT")
 def is_callable_coroutine(func_or_cls: Any) -> bool:
     if inspect.iscoroutinefunction(func_or_cls):
         return True
+    elif inspect.isasyncgenfunction(func_or_cls):
+        return True
     elif callable(func_or_cls):
-        return inspect.iscoroutinefunction(func_or_cls.__call__)
+        return inspect.iscoroutinefunction(
+            func_or_cls.__call__
+        ) or inspect.isasyncgenfunction(func_or_cls.__call__)
     return False
 
 
@@ -33,14 +35,14 @@ T = TypeVar("T")
 
 
 async def tg_collect(
-    funcs: list[Callable[[], Awaitable[T]]], exception_group: bool = False
+    funcs: Iterable[Callable[[], Awaitable[T]]], exception_group: bool = False
 ) -> list[T]:
     """Runs all of the passed async functions and collects their results.
 
     The results will be returned in the same order as the input `funcs`.
 
     Args:
-       funcs: List of async functions.
+       funcs: Iterable of async functions.
        exception_group: `True` to raise an ExceptionGroup or
           `False` (the default) to raise only the first exception.
 
@@ -58,12 +60,12 @@ async def tg_collect(
 
         async with anyio.create_task_group() as tg:
 
-            async def run_task(index: int) -> None:
-                result = await funcs[index]()
+            async def run_task(func: Callable[[], Awaitable[T]], index: int) -> None:
+                result = await func()
                 results.append((index, result))
 
-            for i in range(0, len(funcs)):
-                tg.start_soon(run_task, i)
+            for index, func in enumerate(funcs):
+                tg.start_soon(run_task, func, index)
 
         # sort results by original index and return just the values
         return [r for _, r in sorted(results)]
@@ -72,40 +74,6 @@ async def tg_collect(
             raise
         else:
             raise ex.exceptions[0] from None
-
-
-def run_in_background(
-    func: Callable[[Unpack[PosArgsT]], Awaitable[None]],
-    *args: Unpack[PosArgsT],
-) -> None:
-    """
-    Runs the given asynchronous function in the background using the most appropriate form of structured concurrency.
-
-    Args:
-      func (Callable[[Unpack[PosArgsT]], Awaitable[None]]): The asynchronous function to run in the background.
-      *args (Unpack[PosArgsT]): Positional arguments to pass to the function.
-
-    Note:
-      The passed function must ensure that it does not raise any exceptions. Exceptions
-      that do escape are considered coding errors, and the behavior is not strictly
-      defined. For example, if within the context of an eval, the eval will fail.
-    """
-    if tg := eval_task_group():
-        tg.start_soon(func, *args)
-    else:
-        if (backend := current_async_backend()) == "asyncio":
-
-            async def wrapper() -> None:
-                try:
-                    await func(*args)
-                except Exception as ex:
-                    raise RuntimeError("Exception escaped from background task") from ex
-
-            asyncio.create_task(wrapper())
-        else:
-            raise RuntimeError(
-                f"run_coroutine cannot be used {'with trio' if backend == 'trio' else 'outside of an async context'}"
-            )
 
 
 async def coro_print_exceptions(
@@ -155,13 +123,15 @@ def run_coroutine(coroutine: Coroutine[None, None, T]) -> T:
             # this will throw if there is no running loop
             asyncio.get_running_loop()
 
-            # initialiase nest_asyncio then we are clear to run
+            # initialize nest_asyncio then we are clear to run
             init_nest_asyncio()
-            return asyncio.run(coroutine)
 
         except RuntimeError:
-            # No running event loop so we are clear to run
-            return asyncio.run(coroutine)
+            # No running event loop so we are clear to run. Exit the exception handler
+            # and run it.
+            pass
+
+        return asyncio.run(coroutine)
 
 
 def current_async_backend() -> Literal["asyncio", "trio"] | None:

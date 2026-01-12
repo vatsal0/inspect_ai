@@ -1,21 +1,13 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from inspect_ai.log import (
-    InfoEvent,
-    LoggerEvent,
-    SpanBeginEvent,
-    SpanEndEvent,
+from inspect_ai.event import (
     SpanNode,
     event_sequence,
     event_tree,
 )
-from inspect_ai.log._message import LoggingMessage
-
-# TODO: these tests currently failing
-# test_task_grouping():
-# test_complex_task_grouping
-# task_order_deterministic
-# test_sequence_preserves_event_order
+from inspect_ai.event._info import InfoEvent
+from inspect_ai.event._logger import LoggerEvent, LoggingMessage
+from inspect_ai.event._span import SpanBeginEvent, SpanEndEvent
 
 
 def test_empty_input():
@@ -211,5 +203,5 @@ def test_sequence_preserves_event_order():
 
 def logger_msg(msg: str) -> LoggingMessage:
     return LoggingMessage(
-        level="info", message="msg", created=datetime.now().timestamp()
+        level="info", message="msg", created=datetime.now(timezone.utc).timestamp()
     )

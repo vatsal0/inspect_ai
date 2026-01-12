@@ -57,7 +57,9 @@ title: "inspect_ai.util"
 
 ## Registry
 
+### registry_info
 ### registry_create
+### RegistryInfo
 ### RegistryType
 
 ## JSON
@@ -65,3 +67,19 @@ title: "inspect_ai.util"
 ### JSONType
 ### JSONSchema
 ### json_schema
+
+## Early Stopping
+
+### EarlyStopping
+### EarlyStoppingSummary
+### EarlyStop
+
+## Compose
+
+### parse_compose_yaml
+### is_compose_yaml
+### is_dockerfile
+### ComposeConfig
+### ComposeService
+### ComposeBuild
+### ComposeHealthcheck

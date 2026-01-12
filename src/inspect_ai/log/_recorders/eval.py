@@ -1,19 +1,20 @@
 import json
+import logging
+import math
 import os
 import tempfile
 from logging import getLogger
-from typing import Any, BinaryIO, Literal, cast
+from typing import IO, Any, BinaryIO, Literal, cast
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import anyio
 from pydantic import BaseModel, Field
-from pydantic_core import to_json
 from typing_extensions import override
 
-from inspect_ai._util.constants import DESERIALIZING_CONTEXT, LOG_SCHEMA_VERSION
-from inspect_ai._util.error import EvalError
+from inspect_ai._util.constants import LOG_SCHEMA_VERSION, get_deserializing_context
+from inspect_ai._util.error import EvalError, WriteConflictError
 from inspect_ai._util.file import FileSystem, dirname, file, filesystem
-from inspect_ai._util.json import jsonable_python
+from inspect_ai._util.json import to_json_safe
 from inspect_ai._util.trace import trace_action
 
 from .._log import (
@@ -63,12 +64,19 @@ class EvalRecorder(FileRecorder):
         return location.endswith(".eval")
 
     @override
-    def default_log_buffer(self) -> int:
+    @classmethod
+    def handles_bytes(cls, first_bytes: bytes) -> bool:
+        return first_bytes == b"PK\x03\x04"  # ZIP local file header
+
+    @override
+    def default_log_buffer(self, sample_count: int) -> int:
         # .eval files are 5-8x smaller than .json files so we
         # are much less worried about flushing frequently
-        return 10
+        # scale flushes in alignment with sample_count so small runs
+        # flush more often (sample by sample) and large runs less often
+        return max(1, min(math.floor(sample_count / 3), 10))
 
-    def __init__(self, log_dir: str, fs_options: dict[str, Any] = {}):
+    def __init__(self, log_dir: str, fs_options: dict[str, Any] | None = None):
         super().__init__(log_dir, ".eval", fs_options)
 
         # each eval has a unique key (created from run_id and task name/version)
@@ -134,6 +142,7 @@ class EvalRecorder(FileRecorder):
         reductions: list[EvalSampleReductions] | None,
         error: EvalError | None = None,
         header_only: bool = False,
+        invalidated: bool = False,
     ) -> EvalLog:
         # get the key and log
         key = self._log_file_key(eval)
@@ -161,6 +170,7 @@ class EvalRecorder(FileRecorder):
 
         eval_header = EvalLog(
             version=log_start.version,
+            invalidated=invalidated,
             eval=log_start.eval,
             plan=log_start.plan,
             results=log_results.results,
@@ -184,19 +194,43 @@ class EvalRecorder(FileRecorder):
         # and then read it from a temp file (eliminates the possiblity of hundreds
         # of small fetches from the zip file streams)
         temp_log: str | None = None
+        etag: str | None = None
         fs = filesystem(location)
+
         if not fs.is_local() and header_only is False:
             with tempfile.NamedTemporaryFile(delete=False) as temp:
                 temp_log = temp.name
-                fs.get_file(location, temp_log)
+                if fs.is_s3():
+                    # download file and get ETag so it matches the content
+                    etag = await _s3_download_with_etag(location, temp_log, fs)
+                else:
+                    fs.get_file(location, temp_log)
 
         # read log (use temp_log if we have it)
         try:
             with file(temp_log or location, "rb") as z:
-                return _read_log(z, location, header_only)
+                log = _read_log(z, location, header_only)
+
+                if etag is not None:
+                    log.etag = etag
+                elif fs.is_s3() and header_only:
+                    file_info = fs.info(location)
+                    # if the file is modified in S3 at this point, the ETag will be incorrect
+                    # this is challenging to fix
+                    # but this should be ok because the ETag is for conditional writes, and only the entire log gets written back
+                    log.etag = file_info.etag
+
+                return log
         finally:
             if temp_log:
                 os.unlink(temp_log)
+
+    @override
+    @classmethod
+    async def read_log_bytes(
+        cls, log_bytes: IO[bytes], header_only: bool = False
+    ) -> EvalLog:
+        return _read_log(log_bytes, location="", header_only=header_only)
 
     @override
     @classmethod
@@ -230,7 +264,7 @@ class EvalRecorder(FileRecorder):
 
                     with zip.open(_sample_filename(id, epoch), "r") as f:
                         return EvalSample.model_validate(
-                            json.load(f), context=DESERIALIZING_CONTEXT
+                            json.load(f), context=get_deserializing_context()
                         )
                 except KeyError:
                     raise IndexError(
@@ -248,16 +282,145 @@ class EvalRecorder(FileRecorder):
 
     @classmethod
     @override
-    async def write_log(cls, location: str, log: EvalLog) -> None:
-        # write using the recorder (so we get all of the extra streams)
-        recorder = EvalRecorder(dirname(location))
-        await recorder.log_init(log.eval, location, clean=True)
-        await recorder.log_start(log.eval, log.plan)
-        for sample in log.samples or []:
-            await recorder.log_sample(log.eval, sample)
-        await recorder.log_finish(
-            log.eval, log.status, log.stats, log.results, log.reductions, log.error
+    async def write_log(
+        cls, location: str, log: EvalLog, if_match_etag: str | None = None
+    ) -> None:
+        fs = filesystem(location)
+        if fs.is_s3() and if_match_etag:
+            # Use S3 conditional write
+            await cls._write_log_s3_conditional(location, log, if_match_etag, fs)
+        else:
+            # Standard write using the recorder (so we get all of the extra streams)
+            await _write_eval_log_with_recorder(log, dirname(location), location)
+
+    @classmethod
+    async def _write_log_s3_conditional(
+        cls, location: str, log: EvalLog, etag: str, fs: FileSystem
+    ) -> None:
+        """Perform S3 conditional write for .eval format using boto3."""
+        import tempfile
+
+        bucket, key = _s3_bucket_and_key(location)
+
+        # create the eval log in a temporary directory first
+        import os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # create a temporary eval file name
+            temp_eval_file = os.path.join(tmpdir, "temp_log.eval")
+
+            # write using the normal recorder to get proper .eval format
+            await _write_eval_log_with_recorder(log, tmpdir, temp_eval_file)
+
+            # read the created file in bytes
+            with open(temp_eval_file, "rb") as f:
+                log_bytes = f.read()
+
+        await _write_s3_conditional(fs, bucket, key, log_bytes, etag, location, logger)
+
+
+async def _write_eval_log_with_recorder(
+    log: EvalLog, recorder_dir: str, output_file: str
+) -> None:
+    """Helper function to write EvalLog using EvalRecorder pattern."""
+    recorder = EvalRecorder(recorder_dir)
+    await recorder.log_init(log.eval, output_file, clean=True)
+    await recorder.log_start(log.eval, log.plan)
+    for sample in log.samples or []:
+        await recorder.log_sample(log.eval, sample)
+    await recorder.log_finish(
+        log.eval,
+        log.status,
+        log.stats,
+        log.results,
+        log.reductions,
+        log.error,
+        invalidated=log.invalidated,
+    )
+
+
+def _s3_bucket_and_key(location: str) -> tuple[str, str]:
+    """Extract S3 bucket and key from an S3 URL."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(location)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    return bucket, key
+
+
+async def _s3_conditional_put_object(
+    fs: FileSystem, bucket: str, key: str, body: bytes, etag: str
+) -> None:
+    """Helper function to perform S3 conditional write with aioboto3."""
+    import aioboto3
+
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=fs.fs.client_kwargs.get("endpoint_url"),
+        region_name=fs.fs.client_kwargs.get("region_name"),
+    ) as s3_client:
+        await s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=body,
+            IfMatch=f'"{etag}"',  # S3 requires quotes around ETag
         )
+
+
+async def _s3_download_with_etag(
+    location: str, local_path: str, fs: FileSystem
+) -> str | None:
+    """
+    Download S3 file and get its ETag in a single operation.
+
+    Returns:
+        ETag of the downloaded file (guaranteed to match the downloaded content)
+    """
+    import aioboto3
+
+    bucket, key = _s3_bucket_and_key(location)
+
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=fs.fs.client_kwargs.get("endpoint_url"),
+        region_name=fs.fs.client_kwargs.get("region_name"),
+    ) as s3_client:
+        response = await s3_client.get_object(Bucket=bucket, Key=key)
+
+        content = await response["Body"].read()
+        with open(local_path, "wb") as f:
+            f.write(content)
+
+        etag: str = response["ETag"]
+        return etag.strip('"')  # S3 returns ETag with quotes
+
+
+async def _write_s3_conditional(
+    fs: FileSystem,
+    bucket: str,
+    key: str,
+    body: bytes,
+    etag: str,
+    location: str,
+    logger: logging.Logger,
+) -> None:
+    """Write to S3 with conditional check and error handling."""
+    from botocore.exceptions import ClientError
+
+    from inspect_ai._util.trace import trace_action
+
+    with trace_action(logger, "Log Conditional Write", location):
+        try:
+            await _s3_conditional_put_object(fs, bucket, key, body, etag)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "PreconditionFailed":
+                raise WriteConflictError(
+                    f"Log file was modified by another process. Expected ETag: {etag}"
+                )
+            raise
 
 
 def read_sample_summaries(zip: ZipFile) -> list[EvalSampleSummary]:
@@ -379,23 +542,18 @@ class ZipLogFile:
         assert self._zip
         self._zip.writestr(
             filename,
-            to_json(
-                value=jsonable_python(data),
-                indent=2,
-                exclude_none=True,
-                fallback=lambda _x: None,
-            ),
+            to_json_safe(data),
         )
 
 
-def _read_log(log: BinaryIO, location: str, header_only: bool = False) -> EvalLog:
+def _read_log(log: IO[bytes], location: str, header_only: bool = False) -> EvalLog:
     with ZipFile(log, mode="r") as zip:
         evalLog = _read_header(zip, location)
         if REDUCTIONS_JSON in zip.namelist():
             with zip.open(REDUCTIONS_JSON, "r") as f:
                 reductions = [
                     EvalSampleReductions.model_validate(
-                        reduction, context=DESERIALIZING_CONTEXT
+                        reduction, context=get_deserializing_context()
                     )
                     for reduction in json.load(f)
                 ]
@@ -410,7 +568,7 @@ def _read_log(log: BinaryIO, location: str, header_only: bool = False) -> EvalLo
                     with zip.open(name, "r") as f:
                         samples.append(
                             EvalSample.model_validate(
-                                json.load(f), context=DESERIALIZING_CONTEXT
+                                json.load(f), context=get_deserializing_context()
                             ),
                         )
             sort_samples(samples)
@@ -446,7 +604,9 @@ def _read_all_summaries(zip: ZipFile, count: int) -> list[EvalSampleSummary]:
         summaries_raw = _read_json(zip, SUMMARIES_JSON)
         if isinstance(summaries_raw, list):
             return [
-                EvalSampleSummary.model_validate(value, context=DESERIALIZING_CONTEXT)
+                EvalSampleSummary.model_validate(
+                    value, context=get_deserializing_context()
+                )
                 for value in summaries_raw
             ]
         else:
@@ -463,7 +623,7 @@ def _read_all_summaries(zip: ZipFile, count: int) -> list[EvalSampleSummary]:
                 summaries.extend(
                     [
                         EvalSampleSummary.model_validate(
-                            value, context=DESERIALIZING_CONTEXT
+                            value, context=get_deserializing_context()
                         )
                         for value in summary
                     ]
@@ -479,12 +639,16 @@ def _read_header(zip: ZipFile, location: str) -> EvalLog:
     # first see if the header is here
     if HEADER_JSON in zip.namelist():
         with zip.open(HEADER_JSON, "r") as f:
-            log = EvalLog.model_validate(json.load(f), context=DESERIALIZING_CONTEXT)
+            log = EvalLog.model_validate(
+                json.load(f), context=get_deserializing_context()
+            )
             log.location = location
             return log
     else:
         with zip.open(_journal_path(START_JSON), "r") as f:
-            start = LogStart.model_validate(json.load(f), context=DESERIALIZING_CONTEXT)
+            start = LogStart.model_validate(
+                json.load(f), context=get_deserializing_context()
+            )
         return EvalLog(
             version=start.version, eval=start.eval, plan=start.plan, location=location
         )

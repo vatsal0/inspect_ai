@@ -1,21 +1,24 @@
 import { FC, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { kLogViewSamplesTabId } from "../../constants";
 import {
   useEvalSpec,
   useFilteredSamples,
   usePrevious,
+  useSampleSummaries,
   useTotalSampleCount,
 } from "../../state/hooks";
+import { useUnloadLog } from "../../state/log";
 import { useStore } from "../../state/store";
-import { baseUrl, useLogRouteParams } from "../routing/url";
+import { baseUrl, logSamplesUrl, useLogRouteParams } from "../routing/url";
 import { LogViewLayout } from "./LogViewLayout";
 
 /**
  * LogContainer component that handles routing to specific logs, tabs, and samples
  */
 export const LogViewContainer: FC = () => {
-  const { logPath, tabId, sampleId, epoch, sampleTabId } = useLogRouteParams();
+  const { logPath, tabId, sampleUuid, sampleId, epoch, sampleTabId } =
+    useLogRouteParams();
 
   const initialState = useStore((state) => state.app.initialState);
   const clearInitialState = useStore(
@@ -26,18 +29,15 @@ export const LogViewContainer: FC = () => {
   const setShowingSampleDialog = useStore(
     (state) => state.appActions.setShowingSampleDialog,
   );
-  const setStatus = useStore((state) => state.appActions.setStatus);
   const setWorkspaceTab = useStore((state) => state.appActions.setWorkspaceTab);
 
-  const refreshLogs = useStore((state) => state.logsActions.refreshLogs);
-  const selectLogFile = useStore((state) => state.logsActions.selectLogFile);
   const selectSample = useStore((state) => state.logActions.selectSample);
-  const setSelectedLogIndex = useStore(
-    (state) => state.logsActions.setSelectedLogIndex,
+  const setSelectedLogFile = useStore(
+    (state) => state.logsActions.setSelectedLogFile,
   );
 
   const clearSelectedLogSummary = useStore(
-    (state) => state.logActions.clearSelectedLogSummary,
+    (state) => state.logActions.clearSelectedLogDetails,
   );
 
   const clearSelectedSample = useStore(
@@ -47,6 +47,46 @@ export const LogViewContainer: FC = () => {
   const filteredSamples = useFilteredSamples();
   const totalSampleCount = useTotalSampleCount();
   const navigate = useNavigate();
+  const sampleSummaries = useSampleSummaries();
+  const [searchParams] = useSearchParams();
+
+  // Unload the log when this is mounted. This prevents the old log
+  // data from being displayed when navigating back to the logs panel
+  // and also ensures that we reload logs when freshly navigating to them.
+  const { unloadLog } = useUnloadLog();
+  useEffect(() => {
+    return () => {
+      unloadLog();
+    };
+  }, [unloadLog]);
+
+  useEffect(() => {
+    // Redirect to an id/epoch url if a sampleUuid is provided
+    if (logPath && sampleUuid && sampleSummaries) {
+      // Find the sample with the matching UUID
+      const sample = sampleSummaries.find((s) => s.uuid === sampleUuid);
+      if (sample) {
+        const url = logSamplesUrl(
+          logPath,
+          sample.id,
+          sample.epoch,
+          sampleTabId,
+        );
+        const finalUrl = searchParams.toString()
+          ? `${url}?${searchParams.toString()}`
+          : url;
+        navigate(finalUrl);
+        return;
+      }
+    }
+  }, [
+    sampleSummaries,
+    logPath,
+    sampleUuid,
+    searchParams,
+    sampleTabId,
+    navigate,
+  ]);
 
   useEffect(() => {
     if (initialState && !evalSpec) {
@@ -58,14 +98,18 @@ export const LogViewContainer: FC = () => {
       clearInitialState();
       navigate(url);
     }
-  }, [initialState, evalSpec]);
+  }, [initialState, evalSpec, clearInitialState, navigate]);
 
   const prevLogPath = usePrevious<string | undefined>(logPath);
+  const syncLogs = useStore((state) => state.logsActions.syncLogs);
+  const initLogDir = useStore((state) => state.logsActions.initLogDir);
 
   useEffect(() => {
     const loadLogFromPath = async () => {
       if (logPath) {
-        await selectLogFile(logPath);
+        await initLogDir();
+        setSelectedLogFile(logPath);
+        void syncLogs();
 
         // Set the tab if specified in the URL
         if (tabId) {
@@ -89,35 +133,28 @@ export const LogViewContainer: FC = () => {
   }, [
     logPath,
     tabId,
-    selectLogFile,
-    refreshLogs,
+    setSelectedLogFile,
     setWorkspaceTab,
-    setSelectedLogIndex,
-    setStatus,
+    initLogDir,
+    syncLogs,
+    prevLogPath,
+    clearSelectedSample,
+    clearSelectedLogSummary,
   ]);
 
   // Handle sample selection from URL params
   useEffect(() => {
     if (sampleId && filteredSamples) {
-      // Find the sample with matching ID and epoch
-      const targetEpoch = epoch ? parseInt(epoch, 10) : undefined;
-      const sampleIndex = filteredSamples.findIndex((sample) => {
-        const matches =
-          String(sample.id) === sampleId &&
-          (targetEpoch === undefined || sample.epoch === targetEpoch);
-        return matches;
-      });
+      const targetEpoch = epoch ? parseInt(epoch, 10) : 1;
+      selectSample(sampleId, targetEpoch);
 
-      if (sampleIndex >= 0) {
-        selectSample(sampleIndex);
-        // Set the sample tab if specified in the URL
-        if (sampleTabId) {
-          setSampleTab(sampleTabId);
-        }
+      // Set the sample tab if specified in the URL
+      if (sampleTabId) {
+        setSampleTab(sampleTabId);
+      }
 
-        if (filteredSamples.length > 1) {
-          setShowingSampleDialog(true);
-        }
+      if (filteredSamples.length > 1) {
+        setShowingSampleDialog(true);
       }
     } else {
       // If we don't have sample params in the URL but the dialog is showing, close it

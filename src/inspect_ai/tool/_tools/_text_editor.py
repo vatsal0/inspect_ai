@@ -4,9 +4,14 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Discriminator, RootModel
 
 from inspect_ai.tool import ToolResult
-from inspect_ai.tool._tool_support_helpers import (
-    exec_scalar_request,
-    tool_support_sandbox,
+from inspect_ai.tool._json_rpc_helpers import exec_scalar_request
+from inspect_ai.tool._sandbox_tools_utils._runtime_helpers import (
+    SandboxJSONRPCTransport,
+    SandboxToolsServerErrorMapper,
+)
+from inspect_ai.tool._sandbox_tools_utils.sandbox import (
+    SANDBOX_TOOLS_CLI,
+    sandbox_with_injected_tools,
 )
 
 from .._tool import Tool, tool
@@ -92,7 +97,7 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
 
         Args:
           command: The command to execute.
-          path: Absolute path to file or directory, e.g. `/repo/file.py` or `/repo`.
+          path: Path to file or directory, e.g. `/repo/file.py` or `../repo`.
           file_text: Required parameter of `create` command, with the content of the file to be created.
           insert_line: Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.
           new_str: Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.
@@ -102,7 +107,7 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
         Returns:
           The output of the command.
         """
-        (sandbox, _) = await tool_support_sandbox("editor")
+        sandbox = await sandbox_with_injected_tools()
 
         # Create a dictionary of the parameters
         params = {
@@ -112,11 +117,13 @@ def text_editor(timeout: int | None = None, user: str | None = None) -> Tool:
         }
 
         return await exec_scalar_request(
-            sandbox=sandbox,
             method="text_editor",
             params=params,
             result_type=TextEditorResult,
+            transport=SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI),
+            server_error_mapper=SandboxToolsServerErrorMapper(),
             timeout=timeout,
+            user=user,
         )
 
     return execute

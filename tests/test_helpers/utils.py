@@ -1,4 +1,6 @@
+import asyncio
 import contextlib
+import functools
 import importlib.util
 import os
 import signal
@@ -7,17 +9,75 @@ import sys
 from pathlib import Path
 from random import random
 from types import FrameType
-from typing import Generator, Sequence
+from typing import Callable, Generator, Sequence, TypeVar
 
 import anyio
 import pytest
 
 from inspect_ai import Task, eval, task
 from inspect_ai._util._async import configured_async_backend
+from inspect_ai._util.entrypoints import clear_entry_points_state
 from inspect_ai.dataset import Sample
 from inspect_ai.model import ChatMessage, ModelName, ModelOutput
 from inspect_ai.scorer import match
 from inspect_ai.solver import Generate, TaskState, generate, solver
+
+F = TypeVar("F", bound=Callable)
+
+
+def flaky_retry(max_retries: int) -> Callable[[F], F]:
+    """
+    Decorator to retry flaky tests up to max_retries times.
+
+    **Use with discretion and as a last resort.** This decorator should only be used
+    for tests that require specific model behavior to trigger the code under test,
+    where the flakiness is due to inherent non-determinism in model responses
+    rather than bugs in our code.
+
+    Before using this decorator, consider:
+    - Can the test be made more deterministic?
+    - Is the flakiness due to a bug that should be fixed?
+    - Can more lenient assertions be used?
+
+    Args:
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        Decorated test function that retries on failure
+    """
+
+    def decorator(func: F) -> F:
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                last_exception = None
+                for attempt in range(max_retries + 1):
+                    try:
+                        return await func(*args, **kwargs)
+                    except Exception as e:
+                        last_exception = e
+                        if attempt < max_retries:
+                            continue
+                        raise last_exception
+
+            return async_wrapper  # type: ignore
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        continue
+                    raise last_exception
+
+        return wrapper  # type: ignore
+
+    return decorator
 
 
 def skip_if_env_var(var: str, exists=True):
@@ -69,6 +129,10 @@ def skip_if_no_accelerate(func):
     return skip_if_no_package("accelerate")(func)
 
 
+def skip_if_no_transformer_lens(func):
+    return skip_if_no_package("transformer_lens")(func)
+
+
 def skip_if_no_openai(func):
     return pytest.mark.api(
         pytest.mark.skipif(
@@ -85,6 +149,14 @@ def skip_if_no_openai_azure(func):
         or os.environ.get("AZUREAI_OPENAI_API_KEY") is None
         or os.environ.get("AZUREAI_OPENAI_BASE_URL") is None,
         reason="Test requires both OpenAI package and AZUREAI_OPENAI_API_KEY and AZUREAI_OPENAI_BASE_URL environment variables",
+    )(func)
+
+
+def skip_if_no_mistral_azure(func):
+    return pytest.mark.skipif(
+        importlib.util.find_spec("mistral") is None
+        or os.environ.get("AZUREAI_MISTRAL_BASE_URL") is None,
+        reason="Test requires both mistral package and AZUREAI_MISTRAL_BASE_URL environment variable",
     )(func)
 
 
@@ -126,8 +198,20 @@ def skip_if_no_together(func):
     return pytest.mark.api(skip_if_env_var("TOGETHER_API_KEY", exists=False)(func))
 
 
+def skip_if_no_openrouter(func):
+    return pytest.mark.api(skip_if_env_var("OPENROUTER_API_KEY", exists=False)(func))
+
+
 def skip_if_no_together_base_url(func):
     return pytest.mark.api(skip_if_env_var("TOGETHER_BASE_URL", exists=False)(func))
+
+
+def skip_if_no_fireworks(func):
+    return pytest.mark.api(skip_if_env_var("FIREWORKS_API_KEY", exists=False)(func))
+
+
+def skip_if_no_sambanova(func):
+    return pytest.mark.api(skip_if_env_var("SAMBANOVA_API_KEY", exists=False)(func))
 
 
 def skip_if_no_perplexity(func):
@@ -165,6 +249,10 @@ def skip_if_no_bedrock(func):
 
 def skip_if_no_vertex(func):
     return pytest.mark.api(skip_if_env_var("ENABLE_VERTEX_TESTS", exists=False)(func))
+
+
+def skip_if_no_hf_token(func):
+    return pytest.mark.api(skip_if_env_var("HF_TOKEN", exists=False)(func))
 
 
 def skip_if_github_action(func):
@@ -215,15 +303,15 @@ def run_example(example: str, model: str):
 # "some" state. Over time this will likely expand and need to be extracted into
 # its own helper file with multiple options.
 def simple_task_state(
-    choices: list[str] = [],
-    messages: list[ChatMessage] = [],
+    choices: list[str] | None = None,
+    messages: list[ChatMessage] | None = None,
     model_output: str = "",
 ) -> TaskState:
     return TaskState(
         choices=choices,
         epoch=0,
         input=[],
-        messages=messages,
+        messages=messages if messages is not None else [],
         model=ModelName(model="fake/model"),
         output=ModelOutput.from_content(model="model", content=model_output),
         sample_id=0,
@@ -300,7 +388,7 @@ def sleep_for_solver(seconds: int):
 
 
 @solver
-def identity_solver():
+def identity_solver(arg: int = 0):
     async def solve(state: TaskState, generate: Generate):
         return state
 
@@ -309,6 +397,7 @@ def identity_solver():
 
 def ensure_test_package_installed():
     try:
+        clear_entry_points_state()
         import inspect_package  # type: ignore # noqa: F401
     except ImportError:
         subprocess.check_call(

@@ -1,4 +1,9 @@
-from inspect_ai._util.registry import RegistryType, registry_create
+from inspect_ai._util.registry import (
+    RegistryInfo,
+    RegistryType,
+    registry_create,
+    registry_info,
+)
 from inspect_ai._util.trace import trace_action, trace_message
 from inspect_ai.util._limit import (
     Limit,
@@ -18,10 +23,19 @@ from ._collect import collect
 from ._concurrency import concurrency
 from ._console import input_screen
 from ._display import DisplayType, display_counter, display_type
+from ._early_stopping import (
+    EarlyStop,
+    EarlyStopping,
+    EarlyStoppingSummary,
+)
 from ._json import JSONSchema, JSONType, json_schema
 from ._panel import InputPanel, input_panel
 from ._resource import resource
 from ._sandbox import (
+    ComposeBuild,
+    ComposeConfig,
+    ComposeHealthcheck,
+    ComposeService,
     OutputLimitExceededError,
     SandboxConnection,
     SandboxEnvironment,
@@ -30,6 +44,9 @@ from ._sandbox import (
     SandboxEnvironments,
     SandboxEnvironmentSpec,
     SandboxEnvironmentType,
+    is_compose_yaml,
+    is_dockerfile,
+    parse_compose_yaml,
     sandbox,
     sandbox_default,
     sandbox_service,
@@ -50,6 +67,10 @@ __all__ = [
     "apply_limits",
     "sample_limits",
     "SampleLimits",
+    "ComposeBuild",
+    "ComposeConfig",
+    "ComposeHealthcheck",
+    "ComposeService",
     "ExecResult",
     "concurrency",
     "DisplayType",
@@ -58,12 +79,15 @@ __all__ = [
     "InputPanel",
     "input_panel",
     "input_screen",
+    "is_compose_yaml",
+    "is_dockerfile",
     "JSONType",
     "JSONSchema",
     "json_schema",
     "Limit",
     "message_limit",
     "OutputLimitExceededError",
+    "parse_compose_yaml",
     "resource",
     "subprocess",
     "LimitExceededError",
@@ -95,6 +119,11 @@ __all__ = [
     "working_limit",
     "trace_action",
     "trace_message",
+    "RegistryInfo",
     "RegistryType",
     "registry_create",
+    "registry_info",
+    "EarlyStopping",
+    "EarlyStop",
+    "EarlyStoppingSummary",
 ]

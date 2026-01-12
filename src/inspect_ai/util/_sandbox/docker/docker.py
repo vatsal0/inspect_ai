@@ -13,6 +13,7 @@ from typing_extensions import override
 from inspect_ai._util.error import PrerequisiteError
 from inspect_ai.util._subprocess import ExecResult, subprocess
 
+from ..compose import COMPOSE_FILES, DOCKERFILE
 from ..environment import (
     HostMapping,
     PortMapping,
@@ -45,7 +46,6 @@ from .compose import (
     compose_services,
     compose_up,
 )
-from .config import CONFIG_FILES, DOCKERFILE
 from .internal import build_internal_image, is_internal_image
 from .prereqs import validate_prereqs
 from .util import ComposeProject, task_project_name
@@ -57,7 +57,7 @@ logger = getLogger(__name__)
 class DockerSandboxEnvironment(SandboxEnvironment):
     @classmethod
     def config_files(cls) -> list[str]:
-        return CONFIG_FILES + [DOCKERFILE]
+        return COMPOSE_FILES + [DOCKERFILE]
 
     @classmethod
     def default_concurrency(cls) -> int | None:
@@ -282,6 +282,7 @@ class DockerSandboxEnvironment(SandboxEnvironment):
         user: str | None = None,
         timeout: int | None = None,
         timeout_retry: bool = True,
+        concurrency: bool = True,
     ) -> ExecResult[str]:
         # additional args
         args = []
@@ -311,6 +312,7 @@ class DockerSandboxEnvironment(SandboxEnvironment):
             timeout_retry=timeout_retry,
             input=input,
             output_limit=SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE,
+            concurrency=concurrency,
         )
         verify_exec_result_size(exec_result)
         if exec_result.returncode == 126 and "permission denied" in exec_result.stdout:
@@ -477,6 +479,9 @@ class DockerSandboxEnvironment(SandboxEnvironment):
             raise ConnectionError(
                 f"Service '{self._service} is not currently running.'"
             )
+
+    def default_polling_interval(self) -> float:
+        return 0.2
 
     def container_file(self, file: str) -> str:
         path = Path(file)

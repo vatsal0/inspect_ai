@@ -15,6 +15,13 @@ let selectedSampleRef: { current: EvalSample | undefined } = {
   current: undefined,
 };
 
+export const kDefaultExcludeEvents = [
+  "sample_init",
+  "sandbox",
+  "state",
+  "store",
+];
+
 export interface SampleSlice {
   sample: SampleState;
   sampleActions: {
@@ -36,6 +43,9 @@ export interface SampleSlice {
     setCollapsedIds: (key: string, collapsed: Record<string, true>) => void;
     collapseId: (key: string, id: string, collapsed: boolean) => void;
     clearCollapsedIds: (key: string) => void;
+    setCollapsedMode: (mode: "collapsed" | "expanded" | null) => void;
+
+    setFilteredEventTypes: (types: string[]) => void;
 
     setVisiblePopover: (id: string) => void;
     clearVisiblePopover: () => void;
@@ -46,12 +56,15 @@ export interface SampleSlice {
     // Loading
     loadSample: (
       logFile: string,
-      sampleSummary: SampleSummary,
+      id: number | string,
+      epoch: number,
+      completed?: boolean,
     ) => Promise<void>;
 
     pollSample: (
       logFile: string,
-      sampleSummary: SampleSummary,
+      id: number | string,
+      epoch: number,
     ) => Promise<void>;
   };
 }
@@ -74,6 +87,10 @@ const initialState: SampleState = {
   // The resolved events
   runningEvents: [],
   collapsedEvents: null,
+  collapsedMode: null,
+  eventFilter: {
+    filteredTypes: [...kDefaultExcludeEvents],
+  },
 
   collapsedIdBuckets: {},
   selectedOutlineId: undefined,
@@ -133,6 +150,7 @@ export const createSampleSlice = (
           state.sample.sample_identifier = undefined;
           state.sample.selectedSampleObject = undefined;
           state.sample.sampleInState = false;
+          state.log.selectedSampleHandle = undefined;
         });
       },
       setSampleStatus: (status: SampleStatus) =>
@@ -159,6 +177,7 @@ export const createSampleSlice = (
           if (state.sample.collapsedEvents !== null) {
             state.sample.collapsedEvents = null;
           }
+          state.sample.collapsedMode = null;
         });
       },
       collapseEvent: (scope: string, id: string, collapsed: boolean) => {
@@ -199,6 +218,16 @@ export const createSampleSlice = (
           delete state.sample.collapsedIdBuckets[key];
         });
       },
+      setCollapsedMode: (mode: "collapsed" | "expanded" | null) => {
+        set((state) => {
+          state.sample.collapsedMode = mode;
+        });
+      },
+      setFilteredEventTypes: (types: string[]) => {
+        set((state) => {
+          state.sample.eventFilter.filteredTypes = types;
+        });
+      },
       setVisiblePopover: (id: string) => {
         set((state) => {
           state.sample.visiblePopover = id;
@@ -219,7 +248,11 @@ export const createSampleSlice = (
           state.sample.selectedOutlineId = undefined;
         });
       },
-      pollSample: async (logFile: string, sampleSummary: SampleSummary) => {
+      pollSample: async (
+        logFile: string,
+        id: number | string,
+        epoch: number,
+      ) => {
         // Poll running sample
         const state = get();
         const sampleExists = state.sample.sampleInState
@@ -227,10 +260,17 @@ export const createSampleSlice = (
           : !!selectedSampleRef.current;
 
         if (state.log.loadedLog && sampleExists) {
+          // Create a minimal SampleSummary object for polling
+          const sampleSummary: SampleSummary = { id, epoch } as SampleSummary;
           samplePolling.startPolling(logFile, sampleSummary);
         }
       },
-      loadSample: async (logFile: string, sampleSummary: SampleSummary) => {
+      loadSample: async (
+        logFile: string,
+        id: number | string,
+        epoch: number,
+        completed?: boolean,
+      ) => {
         const sampleActions = get().sampleActions;
 
         sampleActions.setSampleError(undefined);
@@ -238,27 +278,18 @@ export const createSampleSlice = (
         const state = get();
 
         try {
-          if (sampleSummary.completed !== false) {
-            log.debug(
-              `LOADING COMPLETED SAMPLE: ${sampleSummary.id}-${sampleSummary.epoch}`,
-            );
-            const sample = await get().api?.get_log_sample(
-              logFile,
-              sampleSummary.id,
-              sampleSummary.epoch,
-            );
-            log.debug(
-              `LOADED COMPLETED SAMPLE: ${sampleSummary.id}-${sampleSummary.epoch}`,
-            );
+          if (completed !== false) {
+            log.debug(`LOADING COMPLETED SAMPLE: ${id}-${epoch}`);
+            const sample = await get().api?.get_log_sample(logFile, id, epoch);
+            log.debug(`LOADED COMPLETED SAMPLE: ${id}-${epoch}`);
             if (sample) {
-              const migratedSample = resolveSample(sample);
-
               if (
                 state.sample.sample_identifier?.id !== sample.id &&
                 state.sample.sample_identifier?.epoch !== sample.epoch
               ) {
                 sampleActions.clearCollapsedEvents();
               }
+              const migratedSample = resolveSample(sample);
               sampleActions.setSelectedSample(migratedSample);
               sampleActions.setSampleStatus("ok");
             } else {
@@ -268,11 +299,10 @@ export const createSampleSlice = (
               );
             }
           } else {
-            log.debug(
-              `POLLING RUNNING SAMPLE: ${sampleSummary.id}-${sampleSummary.epoch}`,
-            );
+            log.debug(`POLLING RUNNING SAMPLE: ${id}-${epoch}`);
 
-            // Poll running sample
+            // Poll running sample - create a minimal SampleSummary object
+            const sampleSummary: SampleSummary = { id, epoch } as SampleSummary;
             samplePolling.startPolling(logFile, sampleSummary);
           }
         } catch (e) {

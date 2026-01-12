@@ -7,30 +7,33 @@ import os
 import time
 from contextvars import ContextVar
 from copy import copy, deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from types import TracebackType
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Literal,
+    NamedTuple,
     Sequence,
     Type,
+    TypeAlias,
     cast,
 )
 
+if TYPE_CHECKING:
+    from inspect_ai.tool import ToolInfo
+
+import anyio
 from pydantic import BaseModel
 from pydantic_core import to_jsonable_python
 from tenacity import (
     RetryCallState,
     retry,
-    retry_if_exception,
-    stop_after_attempt,
-    stop_after_delay,
-    stop_never,
-    wait_exponential_jitter,
 )
-from tenacity.stop import StopBaseT
+from tenacity.wait import WaitBaseT
 
 from inspect_ai._util.constants import (
     DEFAULT_MAX_CONNECTIONS,
@@ -39,11 +42,13 @@ from inspect_ai._util.constants import (
 )
 from inspect_ai._util.content import (
     Content,
+    ContentAudio,
+    ContentDocument,
     ContentImage,
     ContentReasoning,
     ContentText,
+    ContentVideo,
 )
-from inspect_ai._util.interrupt import check_sample_interrupt
 from inspect_ai._util.logger import warn_once
 from inspect_ai._util.notgiven import NOT_GIVEN, NotGiven
 from inspect_ai._util.platform import platform_init
@@ -56,7 +61,10 @@ from inspect_ai._util.registry import (
 from inspect_ai._util.retry import report_http_retry
 from inspect_ai._util.trace import trace_action
 from inspect_ai._util.working import report_sample_waiting_time, sample_working_time
+from inspect_ai.model._reasoning import reasoning_to_think_tag
+from inspect_ai.model._retry import model_retry_config
 from inspect_ai.tool import Tool, ToolChoice, ToolFunction, ToolInfo
+from inspect_ai.tool._mcp._remote import is_mcp_server_tool
 from inspect_ai.tool._tool import ToolSource
 from inspect_ai.tool._tool_call import ToolCallModelInputHints
 from inspect_ai.tool._tool_def import ToolDef, tool_defs
@@ -67,14 +75,13 @@ from inspect_ai.util._limit import (
     record_model_usage,
 )
 
-from ._cache import CacheEntry, CachePolicy, cache_fetch, cache_store
+from ._cache import CacheEntry, CachePolicy, cache_fetch, cache_store, epoch
 from ._call_tools import (
     disable_parallel_tools,
     execute_tools,
+    get_tools_info,
+    resolve_tools,
     tool_call_view,
-)
-from ._call_tools import (
-    tools_info as get_tools_info,
 )
 from ._chat_message import (
     ChatMessage,
@@ -94,8 +101,36 @@ from ._generate_config import (
 )
 from ._model_call import ModelCall
 from ._model_output import ModelOutput, ModelUsage
+from ._tokens import count_media_tokens, count_text_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
+
+
+class GenerateInput(NamedTuple):
+    """Input parameters for generate function."""
+
+    input: list[ChatMessage]
+    """Chat message input."""
+
+    tools: list[ToolInfo]
+    """Tools available for the model to call."""
+
+    tool_choice: ToolChoice | None
+    """Directives to the model as to which tools to prefer."""
+
+    config: GenerateConfig
+    """Model configuration."""
+
+
+GenerateFilter: TypeAlias = Callable[
+    [str, list[ChatMessage], list[ToolInfo], ToolChoice | None, GenerateConfig],
+    Awaitable[ModelOutput | GenerateInput | None],
+]
+"""Filter a model generation.
+
+A filter may substitute for the default model generation by returning a
+`ModelOutput`, modify the input parameters by returning a `GenerateInput`, or return `None` to allow default processing to continue.
+"""
 
 
 class ModelAPI(abc.ABC):
@@ -130,11 +165,16 @@ class ModelAPI(abc.ABC):
         """
         self.model_name = model_name
         self.base_url = base_url
+        self.api_key = api_key
+        self.api_key_vars = api_key_vars
+        self._apply_api_key_overrides()
 
+    def _apply_api_key_overrides(self) -> None:
         from inspect_ai.hooks._hooks import override_api_key
 
         # apply api key override
-        for key in api_key_vars:
+        api_key = self.api_key
+        for key in self.api_key_vars:
             # if there is an explicit api_key passed then it
             # overrides anything in the environment so use it
             if api_key is not None:
@@ -153,6 +193,13 @@ class ModelAPI(abc.ABC):
         # set any explicitly specified api key
         self.api_key = api_key
 
+    def initialize(self) -> None:
+        """Reinitialize the model API client.
+
+        This can be used to reinitialize the API keys.
+        """
+        self._apply_api_key_overrides()
+
     async def aclose(self) -> None:
         """Async close method for closing any client allocated for the model."""
         self.close()
@@ -168,6 +215,10 @@ class ModelAPI(abc.ABC):
                 f"{self.__class__.__name__} models require an async close / context manager."
             )
 
+    def canonical_name(self) -> str:
+        """Canonical model name for querying results."""
+        return self.model_name
+
     @abc.abstractmethod
     async def generate(
         self,
@@ -179,14 +230,10 @@ class ModelAPI(abc.ABC):
         """Generate output from the model.
 
         Args:
-          input (str | list[ChatMessage]): Chat message
-            input (if a `str` is passed it is converted
-            to a `ChatUserMessage`).
-          tools (list[ToolInfo]): Tools available for the
-            model to call.
-          tool_choice (ToolChoice): Directives to the model
-            as to which tools to prefer.
-          config (GenerateConfig): Model configuration.
+          input: Chat message input (if a `str` is passed it is converted to a `ChatUserMessage`).
+          tools: Tools available for the model to call.
+          tool_choice: Directives to the model as to which tools to prefer.
+          config: Model configuration.
 
         Returns:
            ModelOutput or tuple[ModelOutput,ModelCall], the latter being
@@ -194,6 +241,48 @@ class ModelAPI(abc.ABC):
            part of the ModelEvent.
         """
         ...
+
+    async def count_tokens(self, input: str | list[ChatMessage]) -> int:
+        """Estimate token count for input.
+
+        This default implementation uses character-based heuristics for text
+        and size-based estimates for media. Model providers can override
+        `count_text_tokens()` and `count_media_tokens()` for more accurate results,
+        or override this method entirely to use their native token counting APIs.
+
+        Args:
+            input: Input to count tokens for.
+        """
+        if isinstance(input, str):
+            return await self.count_text_tokens(input)
+        else:
+            return await count_tokens(
+                input, self.count_text_tokens, self.count_media_tokens
+            )
+
+    async def count_text_tokens(self, text: str) -> int:
+        """Estimate tokens from text using tiktoken (o200k_base with 10% buffer).
+
+        Override this method to use model-specific tokenizers.
+
+        Args:
+            text: Text to count.
+        """
+        return count_text_tokens(text)
+
+    async def count_media_tokens(
+        self, media: ContentImage | ContentAudio | ContentVideo | ContentDocument
+    ) -> int:
+        """Estimate tokens for media content (images, audio, video, documents).
+
+        For data URIs, estimates are based on decoded size. For URLs/file paths,
+        uses conservative fixed fallbacks. Override this method for provider-specific
+        media token calculations.
+
+        Args:
+            media: Media content to count tokens for.
+        """
+        return count_media_tokens(media)
 
     def max_tokens(self) -> int | None:
         """Default max_tokens."""
@@ -226,6 +315,20 @@ class ModelAPI(abc.ABC):
         """
         return False
 
+    def retry_wait(self) -> WaitBaseT | None:
+        return None
+
+    def is_auth_failure(self, ex: Exception) -> bool:
+        """Check if this exception indicates an authentication failure.
+
+        Args:
+           ex: Exception to check for authentication failure
+
+        Returns:
+           True if this is an authentication error (e.g., 401 Unauthorized)
+        """
+        return False
+
     def collapse_user_messages(self) -> bool:
         """Collapse consecutive user messages into a single message."""
         return False
@@ -236,6 +339,10 @@ class ModelAPI(abc.ABC):
 
     def tools_required(self) -> bool:
         """Any tool use in a message stream means that tools must be passed."""
+        return False
+
+    def supports_remote_mcp(self) -> bool:
+        """Does this provider support remote execution of MCP tools?."""
         return False
 
     def tool_result_images(self) -> bool:
@@ -258,6 +365,10 @@ class ModelAPI(abc.ABC):
         """Behavior to use for reasoning_history='auto'"""
         return "all"
 
+    def compact_reasoning_history(self) -> bool:
+        """Is reasoning history eligible for compation for this provider?"""
+        return True
+
 
 class Model:
     """Model interface.
@@ -279,7 +390,10 @@ class Model:
     """Generation config."""
 
     def __init__(
-        self, api: ModelAPI, config: GenerateConfig, model_args: dict[str, Any] = {}
+        self,
+        api: ModelAPI,
+        config: GenerateConfig,
+        model_args: dict[str, Any] | None = None,
     ) -> None:
         """Create a model.
 
@@ -290,7 +404,7 @@ class Model:
         """
         self.api = api
         self.config = config
-        self.model_args = model_args
+        self.model_args = model_args if model_args is not None else {}
         self._role: str | None = None
 
         # state indicating whether our lifetime is bound by a context manager
@@ -333,6 +447,10 @@ class Model:
         """Model name."""
         return self.api.model_name
 
+    def canonical_name(self) -> str:
+        """Canonical model name for model info database lookup."""
+        return self.api.canonical_name()
+
     @property
     def role(self) -> str | None:
         """Model role."""
@@ -350,7 +468,7 @@ class Model:
         tools: Sequence[Tool | ToolDef | ToolInfo | ToolSource] | ToolSource = [],
         tool_choice: ToolChoice | None = None,
         config: GenerateConfig = GenerateConfig(),
-        cache: bool | CachePolicy = False,
+        cache: bool | CachePolicy | NotGiven = NOT_GIVEN,
     ) -> ModelOutput:
         """Generate output from the model.
 
@@ -365,6 +483,14 @@ class Model:
         Returns:
            ModelOutput
         """
+        # if we have a TaskState then update the epoch. without this, it's possible
+        # we'd cache the same response for every single epoch
+        from inspect_ai.solver._task_state import sample_state
+
+        state = sample_state()
+        if state is not None:
+            epoch.set(state.epoch)
+
         # if we are the default model then update the displayed message count
         is_active_model = self == active_model()
         if is_active_model:
@@ -379,11 +505,29 @@ class Model:
         base_config = self.config
 
         # if we are the active_model then merge active generate config
+        active_config = active_generate_config()
         if is_active_model:
-            base_config = base_config.merge(active_generate_config())
+            base_config = base_config.merge(active_config)
+
+        ## otherwise merge connection-oriented config
+        else:
+            base_config = base_config.merge(
+                GenerateConfig(
+                    max_connections=active_config.max_connections,
+                    max_retries=active_config.max_retries,
+                    timeout=active_config.timeout,
+                )
+            )
 
         # merge passed config
         config = base_config.merge(config)
+
+        # resolve cache (prefer arg, fall back to config)
+        if isinstance(cache, NotGiven):
+            if config.cache is not None:
+                cache = config.cache
+            else:
+                cache = False
 
         # provide max_tokens from the model api if required
         if config.max_tokens is None:
@@ -404,7 +548,7 @@ class Model:
             input = [ChatMessageSystem(content=config.system_message)] + input
 
         # enforce concurrency limits
-        start_time = datetime.now()
+        start_time = datetime.now(timezone.utc)
         working_start = sample_working_time()
         async with self._connection_concurrency(config):
             # generate
@@ -421,12 +565,12 @@ class Model:
             # created _after_ the call to _generate, potentially in response
             # to retries, so they need their timestamp updated so it accurately
             # reflects the full start/end time which we know here)
-            from inspect_ai.log._transcript import ModelEvent
+            from inspect_ai.event._model import ModelEvent
 
             assert isinstance(event, ModelEvent)
             event.timestamp = start_time
             event.working_start = working_start
-            completed = datetime.now()
+            completed = datetime.now(timezone.utc)
             event.completed = completed
             event.working_time = (
                 output.time
@@ -442,7 +586,7 @@ class Model:
         input: str | list[ChatMessage],
         tools: Sequence[Tool | ToolDef | ToolSource] | ToolSource = [],
         config: GenerateConfig = GenerateConfig(),
-        cache: bool | CachePolicy = False,
+        cache: bool | CachePolicy | NotGiven = NOT_GIVEN,
     ) -> tuple[list[ChatMessage], ModelOutput]:
         """Generate output from the model, looping as long as the model calls tools.
 
@@ -486,34 +630,76 @@ class Model:
             else:
                 return messages[len(input) :], output
 
+    async def count_tokens(self, input: str | list[ChatMessage]) -> int:
+        """Estimate token count for input.
+
+        Args:
+           input: Input to count tokens for.
+        """
+        model_name = ModelName(self)
+        key = f"ModelCountTokens({self.api.connection_key()})"
+        async with concurrency(f"{model_name}_count_tokens", 10, key, visible=False):
+            # retry handler for token counting
+            @retry(
+                **model_retry_config(
+                    self.api.model_name,
+                    self.config.max_retries,
+                    self.config.timeout,
+                    self.should_retry,
+                    self.before_retry,
+                    log_model_retry,
+                    report_sample_waiting_time,
+                    self.api.retry_wait(),
+                )
+            )
+            async def _count_tokens(input: str | list[ChatMessage]) -> int:
+                return await self.api.count_tokens(input)
+
+            # count tokens
+            return await _count_tokens(input)
+
+    async def count_tool_tokens(self, tools: Sequence[ToolInfo]) -> int:
+        """Count tokens for tool definitions.
+
+        Args:
+            tools: List of tool definitions.
+
+        Returns:
+            Total token count for all tool definitions.
+        """
+        # create a message with the tool tokens embedded and count that
+        tool_json = ""
+        for tool in tools:
+            tool_json += json.dumps(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters.model_dump(exclude_none=True),
+                    },
+                }
+            )
+        return await self.count_tokens([ChatMessageUser(content=tool_json)])
+
     async def _generate(
         self,
         input: list[ChatMessage],
         tools: Sequence[Tool | ToolDef | ToolInfo | ToolSource] | ToolSource,
         tool_choice: ToolChoice | None,
         config: GenerateConfig,
-        cache: bool | CachePolicy = False,
+        cache: bool | CachePolicy | NotGiven = NOT_GIVEN,
     ) -> tuple[ModelOutput, BaseModel]:
-        from inspect_ai.hooks._hooks import emit_model_usage
+        from inspect_ai.event._model import ModelEvent
+        from inspect_ai.hooks._hooks import emit_model_cache_usage, emit_model_usage
         from inspect_ai.hooks._legacy import send_telemetry_legacy
         from inspect_ai.log._samples import track_active_model_event
-        from inspect_ai.log._transcript import ModelEvent
 
         # default to 'auto' for tool_choice (same as underlying model apis)
         tool_choice = tool_choice if tool_choice is not None else "auto"
 
-        # resolve top level tool source
-        if isinstance(tools, ToolSource):
-            tools = await tools.tools()
-
-        # resolve tool sources
-        resolved_tools: list[Tool | ToolDef | ToolInfo] = []
-        for tool in tools:
-            if isinstance(tool, ToolSource):
-                source_tools = await tool.tools()
-                resolved_tools.extend(source_tools)
-            else:
-                resolved_tools.append(tool)
+        # resolve tools
+        resolved_tools = await resolve_tools(tools)
 
         # extract tool defs if we can
         tdefs = await tool_defs(
@@ -522,6 +708,15 @@ class Model:
 
         # resolve all tools into tool_info
         tools_info = get_tools_info(resolved_tools)
+
+        # raise error if we don't support remote_mcp and we have an mcp server
+        if not self.api.supports_remote_mcp():
+            for tool in tools_info:
+                if is_mcp_server_tool(tool):
+                    raise RuntimeError(
+                        f"Remote MCP execution is not supported for {self}. "
+                        + 'Please use "local" execution instead.'
+                    )
 
         # if we have a specific tool selected then filter out the others
         if isinstance(tool_choice, ToolFunction):
@@ -565,38 +760,40 @@ class Model:
         if self.api.collapse_assistant_messages():
             input = collapse_consecutive_assistant_messages(input)
 
-        # retry for transient http errors:
-        # - use config.max_retries and config.timeout if specified, otherwise retry forever
-        # - exponential backoff starting at 3 seconds (will wait 25 minutes
-        #   on the 10th retry,then will wait no longer than 30 minutes on
-        #   subsequent retries)
-        if config.max_retries is not None and config.timeout is not None:
-            stop: StopBaseT = stop_after_attempt(config.max_retries) | stop_after_delay(
-                config.timeout
-            )
-        elif config.max_retries is not None:
-            stop = stop_after_attempt(config.max_retries)
-        elif config.timeout is not None:
-            stop = stop_after_delay(config.timeout)
+        # resolve cache policy
+        if isinstance(cache, NotGiven):
+            cache_policy: bool | CachePolicy | None = config.cache
         else:
-            stop = stop_never
+            cache_policy = cache
+
+        # track reported waiting time during this generate call
+        reported_waiting_time = 0.0
+
+        def report_waiting_time(waiting_time: float) -> None:
+            nonlocal reported_waiting_time
+            report_sample_waiting_time(waiting_time)
+            reported_waiting_time += waiting_time
 
         @retry(
-            wait=wait_exponential_jitter(initial=3, max=(30 * 60), jitter=3),
-            retry=retry_if_exception(self.should_retry),
-            stop=stop,
-            before_sleep=functools.partial(log_model_retry, self.api.model_name),
+            **model_retry_config(
+                self.api.model_name,
+                config.max_retries,
+                config.timeout,
+                self.should_retry,
+                self.before_retry,
+                log_model_retry,
+                report_waiting_time,
+                self.api.retry_wait(),
+            )
         )
         async def generate() -> tuple[ModelOutput, BaseModel]:
             # type-checker can't see that we made sure tool_choice is not none in the outer frame
             assert tool_choice is not None
 
-            check_sample_interrupt()
-
             cache_entry: CacheEntry | None
-            if cache:
-                if isinstance(cache, CachePolicy):
-                    policy = cache
+            if cache_policy:
+                if isinstance(cache_policy, CachePolicy):
+                    policy = cache_policy
                 else:
                     policy = CachePolicy()
 
@@ -620,6 +817,10 @@ class Model:
                         output=existing,
                         call=None,
                     )
+                    if existing.usage:
+                        await emit_model_cache_usage(
+                            model_name=str(self), usage=existing.usage
+                        )
                     return existing, event
             else:
                 cache_entry = None
@@ -637,17 +838,31 @@ class Model:
                 cache="write" if cache else None,
             )
 
+            # create timeout context manager if we have an attempt timeout
+            timeout_cm = (
+                anyio.move_on_after(config.attempt_timeout)
+                if config.attempt_timeout is not None
+                else contextlib.nullcontext()
+            )
+
             with trace_action(logger, "Model", f"generate ({str(self)})"):
                 time_start = time.monotonic()
                 try:
                     assert isinstance(event, ModelEvent)
                     with track_active_model_event(event):
-                        result = await self.api.generate(
-                            input=input,
-                            tools=tools_info,
-                            tool_choice=tool_choice,
-                            config=config,
-                        )
+                        with timeout_cm:
+                            result = await self.api.generate(
+                                input=input,
+                                tools=tools_info,
+                                tool_choice=tool_choice,
+                                config=config,
+                            )
+                        if (
+                            isinstance(timeout_cm, anyio.CancelScope)
+                            and timeout_cm.cancel_called
+                        ):
+                            raise AttemptTimeoutError(config.attempt_timeout)
+
                 finally:
                     time_elapsed = time.monotonic() - time_start
 
@@ -702,24 +917,43 @@ class Model:
 
             return output, event
 
-        # call the model (this will so retries, etc., so report waiting time
+        # call the model (this will do retries, etc., so report waiting time
         # as elapsed time - actual time for successful model call)
         time_start = time.monotonic()
         model_output, event = await generate()
         total_time = time.monotonic() - time_start
         if model_output.time:
-            report_sample_waiting_time(total_time - model_output.time)
+            # we've already reported some of the waiting time in tenacity callbacks
+            # any remaining waiting time will have been due to internal retry within
+            # model providers, which we can get from:
+            #    total_time - reported_waiting_time - model_call_time
+            report_sample_waiting_time(
+                total_time - reported_waiting_time - model_output.time
+            )
 
         # return results
         return model_output, event
 
     def should_retry(self, ex: BaseException) -> bool:
         if isinstance(ex, Exception):
+            # attempt timeout is always retried (we rely on `timeout`
+            # and/or `max_retries` for termination)
+            if isinstance(ex, AttemptTimeoutError):
+                return True
+
             # check standard should_retry() method
             retry = self.api.should_retry(ex)
             if retry:
                 report_http_retry()
                 return True
+
+            from inspect_ai.hooks._hooks import has_api_key_override
+
+            if has_api_key_override():
+                retry = self.api.is_auth_failure(ex)
+                if retry:
+                    report_http_retry()
+                    return True
 
             # see if the API implements legacy is_rate_limit() method
             is_rate_limit = getattr(self.api, "is_rate_limit", None)
@@ -736,6 +970,13 @@ class Model:
 
         # no retry
         return False
+
+    async def before_retry(self, ex: BaseException) -> None:
+        if isinstance(ex, Exception) and self.api.is_auth_failure(ex):
+            # close existing model instance
+            await self.api.aclose()
+            # re-initialize
+            self.api.initialize()
 
     # function to verify that its okay to call model apis
     def verify_model_apis(self) -> None:
@@ -786,7 +1027,8 @@ class Model:
         output: ModelOutput | None = None,
         call: ModelCall | None = None,
     ) -> tuple[Callable[[ModelOutput | Exception, ModelCall | None], None], BaseModel]:
-        from inspect_ai.log._transcript import ModelEvent, transcript
+        from inspect_ai.event._model import ModelEvent
+        from inspect_ai.log._transcript import transcript
 
         # create event and add it to the transcript
         model = str(self)
@@ -826,6 +1068,11 @@ class Model:
             complete(output, call)
 
         return complete, event
+
+
+class AttemptTimeoutError(RuntimeError):
+    def __init__(self, timeout: int | None) -> None:
+        super().__init__(f"attempt_timeout '{timeout or 0}' exceeded.")
 
 
 class ModelName:
@@ -972,7 +1219,9 @@ def get_model(
         if model is not None:
             model = model.split(",")[0]
         else:
-            raise ValueError("No model specified (and no INSPECT_EVAL_MODEL defined)")
+            raise ValueError(
+                "No model specified (and no model environment varible defined)"
+            )
 
     # see if we can return a memoized model instance
     # (exclude mockllm since custom_outputs is an infinite generator)
@@ -994,6 +1243,7 @@ def get_model(
 
     # split model into api name and model name if necessary
     api_name = None
+    original_model = model
     parts = model.split("/")
     if len(parts) > 1:
         api_name = parts[0]
@@ -1029,8 +1279,14 @@ def get_model(
             _models[model_cache_key] = m
         return m
     else:
-        from_api = f" from {api_name}" if api_name else ""
-        raise ValueError(f"Model name {model}{from_api} not recognized.")
+        if api_name is None:
+            raise ValueError(
+                f"Model name {original_model!r} should be in the format of <api_name>/<model_name>."
+            )
+        else:
+            raise ValueError(
+                f"Model API {api_name} of model {original_model!r} not recognized."
+            )
 
 
 # cache for memoization of get_model
@@ -1193,9 +1449,7 @@ def resolve_reasoning_history(
                 content: list[Content] = []
                 for c in message.content:
                     if isinstance(c, ContentReasoning):
-                        content.append(
-                            ContentText(text=f"<think>\n{c.reasoning}\n</think>")
-                        )
+                        content.append(ContentText(text=reasoning_to_think_tag(c)))
                     else:
                         content.append(c)
                 message = message.model_copy(update={"content": content})
@@ -1293,7 +1547,6 @@ def tool_result_images_reducer(
                     content=edited_tool_message_content,
                     tool_call_id=message.tool_call_id,
                     function=message.function,
-                    internal=message.internal,
                 )
             ],
             pending_content + new_user_message_content,
@@ -1403,14 +1656,21 @@ def combine_messages(
     # `content` have default values, it's more the case that they're reset to
     # default values rather than dropped.
 
+    # track combination
+    metadata = {"combined_from": [a.id, b.id]}
+
     if isinstance(a.content, str) and isinstance(b.content, str):
-        return message_type(id=a.id, content=f"{a.content}\n{b.content}")
+        return message_type(content=f"{a.content}\n{b.content}", metadata=metadata)
     elif isinstance(a.content, list) and isinstance(b.content, list):
-        return message_type(id=a.id, content=a.content + b.content)
+        return message_type(content=a.content + b.content, metadata=metadata)
     elif isinstance(a.content, str) and isinstance(b.content, list):
-        return message_type(id=a.id, content=[ContentText(text=a.content), *b.content])
+        return message_type(
+            content=[ContentText(text=a.content), *b.content], metadata=metadata
+        )
     elif isinstance(a.content, list) and isinstance(b.content, str):
-        return message_type(id=a.id, content=a.content + [ContentText(text=b.content)])
+        return message_type(
+            content=a.content + [ContentText(text=b.content)], metadata=metadata
+        )
     else:
         raise TypeError(
             f"Cannot combine messages with invalid content types: {a.content!r}, {b.content!r}"
@@ -1461,8 +1721,14 @@ def set_total_messages(input: str | list[ChatMessage]) -> None:
     set_active_sample_total_messages(total_messages)
 
 
-def init_model_usage() -> None:
-    model_usage_context_var.set({})
+def init_model_usage(initial_usage: dict[str, ModelUsage] | None = None) -> None:
+    # explicit intialization
+    if initial_usage is not None:
+        model_usage_context_var.set(initial_usage)
+
+    # default initialization (ignore if we've already been explicitly intialized)
+    elif len(model_usage_context_var.get()) == 0:
+        model_usage_context_var.set({})
 
 
 def init_sample_model_usage() -> None:

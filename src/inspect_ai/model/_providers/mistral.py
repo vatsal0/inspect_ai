@@ -4,6 +4,7 @@ import os
 from typing import Any, Literal
 
 from mistralai import (
+    AudioChunk,
     ContentChunk,
     DocumentURLChunk,
     FileChunk,
@@ -14,6 +15,7 @@ from mistralai import (
     Mistral,
     ReferenceChunk,
     TextChunk,
+    ThinkChunk,
 )
 from mistralai.models import (
     AssistantMessage as MistralAssistantMessage,
@@ -40,10 +42,9 @@ from mistralai.models import UserMessage as MistralUserMessage
 from mistralai.models.chatcompletionresponse import (
     ChatCompletionResponse as MistralChatCompletionResponse,
 )
+from shortuuid import uuid
 from typing_extensions import override
 
-# TODO: Migration guide:
-# https://github.com/mistralai/client-python/blob/main/MIGRATION.md
 from inspect_ai._util.constants import NO_CONTENT
 from inspect_ai._util.content import (
     Content,
@@ -71,12 +72,23 @@ from .._model_output import (
     ModelUsage,
     StopReason,
 )
-from .util import environment_prerequisite_error, model_base_url
+from .mistral_conversation import (
+    mistral_conversation_generate,
+)
+from .util import (
+    environment_prerequisite_error,
+    model_base_url,
+    require_azure_base_url,
+    resolve_api_key,
+)
 from .util.hooks import HttpxHooks
 
 AZURE_MISTRAL_API_KEY = "AZURE_MISTRAL_API_KEY"
 AZUREAI_MISTRAL_API_KEY = "AZUREAI_MISTRAL_API_KEY"
 MISTRAL_API_KEY = "MISTRAL_API_KEY"
+
+
+AZURE_MISTRAL_BASE_URL_VARS = ["AZUREAI_MISTRAL_BASE_URL", "AZURE_MISTRAL_BASE_URL"]
 
 
 class MistralAPI(ModelAPI):
@@ -86,6 +98,7 @@ class MistralAPI(ModelAPI):
         base_url: str | None = None,
         api_key: str | None = None,
         config: GenerateConfig = GenerateConfig(),
+        conversation_api: bool | None = None,
         **model_args: Any,
     ):
         # extract any service prefix from model name
@@ -107,11 +120,19 @@ class MistralAPI(ModelAPI):
             config=config,
         )
 
+        # track use of conversation api
+        if conversation_api is not None:
+            self.conversation_api = conversation_api
+        elif "voxtral" in model_name:  # no audio in conversation api
+            self.conversation_api = False
+        else:
+            self.conversation_api = True
+
         # resolve api_key
         if not self.api_key:
             if self.is_azure():
-                self.api_key = os.environ.get(
-                    AZUREAI_MISTRAL_API_KEY, os.environ.get(AZURE_MISTRAL_API_KEY, None)
+                self.api_key = resolve_api_key(
+                    [AZUREAI_MISTRAL_API_KEY, AZURE_MISTRAL_API_KEY]
                 )
             else:
                 self.api_key = os.environ.get(MISTRAL_API_KEY, None)
@@ -123,12 +144,9 @@ class MistralAPI(ModelAPI):
 
         if not self.base_url:
             if self.is_azure():
-                self.base_url = model_base_url(base_url, "AZUREAI_MISTRAL_BASE_URL")
-                if not self.base_url:
-                    raise ValueError(
-                        "You must provide a base URL when using Mistral on Azure. Use the AZUREAI_MISTRAL_BASE_URL "
-                        + " environment variable or the --model-base-url CLI flag to set the base URL."
-                    )
+                self.base_url = require_azure_base_url(
+                    self.base_url, AZURE_MISTRAL_BASE_URL_VARS, "Mistral"
+                )
             else:
                 self.base_url = model_base_url(base_url, "MISTRAL_BASE_URL")
 
@@ -151,6 +169,19 @@ class MistralAPI(ModelAPI):
         with Mistral(api_key=self.api_key, **self.model_args) as client:
             # create time tracker
             http_hooks = HttpxHooks(client.sdk_configuration.async_client)
+
+            # use the conversation api if requested
+            if self.conversation_api:
+                return await mistral_conversation_generate(
+                    client=client,
+                    http_hooks=http_hooks,
+                    model=self.service_model_name(),
+                    input=input,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    config=config,
+                    handle_bad_request=self.handle_bad_request,
+                )
 
             # build request
             request_id = http_hooks.start_request()
@@ -233,9 +264,17 @@ class MistralAPI(ModelAPI):
                 ),
             ), model_call()
 
+    @override
+    def emulate_reasoning_history(self) -> bool:
+        return False
+
     def service_model_name(self) -> str:
         """Model name without any service prefix."""
         return self.model_name.replace(f"{self.service}/", "", 1)
+
+    def canonical_name(self) -> str:
+        """Canonical model name for model info database lookup."""
+        return f"mistral/{self.service_model_name()}"
 
     @override
     def should_retry(self, ex: Exception) -> bool:
@@ -250,10 +289,17 @@ class MistralAPI(ModelAPI):
     def connection_key(self) -> str:
         return str(self.api_key)
 
+    @override
+    def is_auth_failure(self, ex: Exception) -> bool:
+        if isinstance(ex, SDKError):
+            return ex.status_code == 401
+        return False
+
     def handle_bad_request(self, ex: SDKError) -> ModelOutput | Exception:
         body = json.loads(ex.body)
         content = body.get("message", ex.body)
-        if "maximum context length" in ex.body:
+        body_lower = ex.body.lower()
+        if "maximum context length" in body_lower or "input too large" in body_lower:
             return ModelOutput.from_content(
                 model=self.service_model_name(),
                 content=content,
@@ -409,11 +455,19 @@ async def mistral_message_content(
 
 def mistral_system_message_content(
     content: str | list[Content],
-) -> str | list[TextChunk]:
+) -> str | list[TextChunk | ThinkChunk]:
     if isinstance(content, str):
         return content or NO_CONTENT
     else:
-        return [TextChunk(text=c.text) for c in content if isinstance(c, ContentText)]
+        message_content: list[TextChunk | ThinkChunk] = []
+        for c in content:
+            if isinstance(c, ContentText):
+                message_content.append(TextChunk(text=c.text))
+            elif isinstance(c, ContentReasoning):
+                message_content.append(
+                    ThinkChunk(thinking=[TextChunk(text=c.reasoning)])
+                )
+        return message_content
 
 
 async def mistral_content_chunk(content: Content) -> ContentChunk:
@@ -425,8 +479,12 @@ async def mistral_content_chunk(content: Content) -> ContentChunk:
 
         # return chunk
         return ImageURLChunk(image_url=ImageURL(url=image_url, detail=content.detail))
+    elif isinstance(content, ContentReasoning):
+        return ThinkChunk(thinking=[TextChunk(text=content.reasoning)])
     else:
-        raise RuntimeError("Mistral models do not support audio or video inputs.")
+        raise RuntimeError(
+            "Mistral models do not support audio, video, and document inputs."
+        )
 
 
 def mistral_tool_call(tool_call: ToolCall) -> MistralToolCall:
@@ -448,7 +506,7 @@ def chat_tool_calls(
 
 
 def chat_tool_call(tool_call: MistralToolCall, tools: list[ToolInfo]) -> ToolCall:
-    id = tool_call.id or tool_call.function.name
+    id = tool_call.id or f"{tool_call.function.name}_{uuid()}"
     if isinstance(tool_call.function.arguments, str):
         return parse_tool_call(
             id, tool_call.function.name, tool_call.function.arguments, tools
@@ -495,11 +553,11 @@ def completion_content_chunks(content: ContentChunk) -> list[Content]:
     if isinstance(content, ReferenceChunk):
         raise TypeError("ReferenceChunk content is not supported by Inspect.")
     elif isinstance(content, TextChunk):
-        parsed = parse_content_with_reasoning(content.text)
-        if parsed:
+        content_text, reasoning = parse_content_with_reasoning(content.text)
+        if reasoning:
             return [
-                ContentReasoning(reasoning=parsed.reasoning),
-                ContentText(text=parsed.content),
+                ContentReasoning(reasoning=reasoning.reasoning),
+                ContentText(text=content_text),
             ]
         else:
             return [ContentText(text=content.text)]
@@ -507,7 +565,7 @@ def completion_content_chunks(content: ContentChunk) -> list[Content]:
         return [ContentText(text=content.document_url)]
     elif isinstance(content, FileChunk):
         return [ContentText(text=f"file: {content.file_id}")]
-    else:
+    elif isinstance(content, ImageURLChunk):
         if isinstance(content.image_url, str):
             return [ContentImage(image=content.image_url)]
         else:
@@ -517,6 +575,16 @@ def completion_content_chunks(content: ContentChunk) -> list[Content]:
                 case _:
                     detail = "auto"
             return [ContentImage(image=content.image_url.url, detail=detail)]
+    elif isinstance(content, ThinkChunk):
+        return [
+            ContentReasoning(
+                reasoning="\n".join(
+                    t.text for t in content.thinking if isinstance(t, TextChunk)
+                )
+            )
+        ]
+    elif isinstance(content, AudioChunk):
+        raise TypeError("AudioChunk content is not supported by Inspect.")
 
 
 def completion_choices_from_response(

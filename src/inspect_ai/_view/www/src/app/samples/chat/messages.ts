@@ -5,9 +5,11 @@ import {
   ChatMessageUser,
   ContentAudio,
   ContentData,
+  ContentDocument,
   ContentImage,
   ContentReasoning,
   ContentText,
+  ContentToolUse,
   ContentVideo,
   Events,
   Messages,
@@ -15,7 +17,11 @@ import {
 import { ApplicationIcons } from "../../appearance/icons";
 
 export interface ResolvedMessage {
-  message: ChatMessageAssistant | ChatMessageSystem | ChatMessageUser;
+  message:
+    | ChatMessageAssistant
+    | ChatMessageSystem
+    | ChatMessageUser
+    | ChatMessageTool;
   toolMessages: ChatMessageTool[];
 }
 
@@ -64,8 +70,10 @@ export const resolveMessages = (messages: Messages) => {
     | ContentImage
     | ContentAudio
     | ContentVideo
+    | ContentDocument
     | ContentReasoning
     | ContentData
+    | ContentToolUse
   )[] = [];
   for (const systemMessage of systemMessages) {
     const contents = Array.isArray(systemMessage.content)
@@ -79,7 +87,6 @@ export const resolveMessages = (messages: Messages) => {
     role: "system",
     content: systemContent,
     source: "input",
-    internal: null,
     metadata: null,
   };
 
@@ -119,16 +126,20 @@ const normalizeContent = (
     | ContentImage
     | ContentAudio
     | ContentVideo
+    | ContentDocument
     | ContentReasoning
     | ContentData
+    | ContentToolUse
     | string,
 ):
   | ContentText
   | ContentImage
   | ContentAudio
   | ContentVideo
+  | ContentDocument
   | ContentReasoning
-  | ContentData => {
+  | ContentData
+  | ContentToolUse => {
   if (typeof content === "string") {
     return {
       type: "text",
