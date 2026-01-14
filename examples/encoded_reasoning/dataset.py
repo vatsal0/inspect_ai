@@ -99,6 +99,14 @@ def add_lorem_ipsum_tokens(question, **kwargs):
     filler = " ".join(LOREM_IPSUM_WORDS[(i - 1) % len(LOREM_IPSUM_WORDS)] for i in range(1, filler_tokens + 1))
     return question + "\n" + filler
 
+def add_fibonacci_tokens(question, **kwargs):
+    filler_tokens = kwargs.pop('filler_tokens', 50)
+    fibs = [0, 1]
+    for _ in range(2, filler_tokens):
+        fibs.append(fibs[-1] + fibs[-2])
+    filler = " ".join(str(fibs[i-1]) for i in range(1, filler_tokens + 1))
+    return question + "\n" + filler
+
 question_transforms = {
     'shorten': shorten,
     'lengthen': lengthen,
@@ -109,7 +117,9 @@ question_transforms = {
     'add_numbers': add_number_tokens,
     'add_ellipses': add_ellipses,
     'add_pause': add_pause_tokens,
+    'add_pause_before': add_pause_tokens_before,
     'add_lorem_ipsum': add_lorem_ipsum_tokens,
+    'add_fibonacci': add_fibonacci_tokens,
 }
 
 def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_questions: bool = False, N: int = 5000, **task_kwargs):

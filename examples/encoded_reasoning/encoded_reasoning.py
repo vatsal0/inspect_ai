@@ -597,6 +597,50 @@ def filler_fewshot_rg_lorem(
     )
 
 @task
+def filler_fewshot_rg_fibonacci_no_hint(
+    task_name: str = "gsm8k",
+    N: int = 100,
+    filler_tokens: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot filler evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        N: Number of samples to evaluate
+        filler_tokens: Number of filler tokens to add after each question
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform="add_fibonacci",
+        q2_transform=None,
+        two_questions=False,
+        N=N + num_fewshot,
+        filler_tokens=filler_tokens,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
+    ]
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples, answer_format="Answer: {answer}"),
+        solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
+        scorer=direct_answer(),
+    )
+
+@task
 def pause(task_name: str = "gsm8k", q1_transform: str = "none", q2_transform: str = "none", N: int = 100, **task_kwargs):
     return Task(
         dataset=custom_dataset(task_name=task_name, q1_transform=q1_transform,
