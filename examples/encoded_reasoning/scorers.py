@@ -171,3 +171,46 @@ def direct_answer_numbers() -> Scorer:
         )
 
     return score
+
+
+@scorer(metrics=[mean(), stderr(), mean_excluding_noanswer(), stderr_excluding_noanswer(), noanswer_rate()])
+def encoded_answer() -> Scorer:
+
+    async def score(state: TaskState, target: Target) -> Score:
+        # Get generated answer and extract relevant answer text
+        answer = state.output.completion
+        targets = target.target[0].split('\n')[1:]
+
+        parsed_answer = answer.split('Answers:')[-1].strip().split(',')[-1].strip()
+
+        is_noanswer = not is_integer(parsed_answer)
+        is_correct = not is_noanswer and parsed_answer == targets[0]
+
+        return Score(
+            value=NOANSWER if is_noanswer else CORRECT if is_correct else INCORRECT,
+            answer=answer,
+            metadata={"result_type": "noanswer" if is_noanswer else "correct" if is_correct else "incorrect"}
+        )
+
+    return score
+
+@scorer(metrics=[mean(), stderr(), mean_excluding_noanswer(), stderr_excluding_noanswer(), noanswer_rate()])
+def reasoning_answer() -> Scorer:
+
+    async def score(state: TaskState, target: Target) -> Score:
+        # Get generated answer and extract relevant answer text
+        answer = state.output.completion
+        targets = target.target
+
+        parsed_answer = answer.split('Answer:')[-1].strip()
+
+        is_noanswer = not is_integer(parsed_answer)
+        is_correct = not is_noanswer and parsed_answer == targets[0]
+
+        return Score(
+            value=NOANSWER if is_noanswer else CORRECT if is_correct else INCORRECT,
+            answer=answer,
+            metadata={"result_type": "noanswer" if is_noanswer else "correct" if is_correct else "incorrect"}
+        )
+
+    return score

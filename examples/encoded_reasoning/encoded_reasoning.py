@@ -14,13 +14,14 @@ ZERO_SHOT_SYSTEM_PROMPT, DOUBLE_ZERO_SHOT_SYSTEM_PROMPT, SINGLE_COT_SYSTEM_PROMP
 DOUBLE_COT_SYSTEM_PROMPT, ENCODED_SYSTEM_PROMPT, ENCODED_SYSTEM_PROMPT_HINT, \
 PAUSE_SYSTEM_PROMPT, PAUSE_SYSTEM_PROMPT_FIXED, PAUSE_SYSTEM_PROMPT_HINT, \
 BLIND_SYSTEM_PROMPT_TRACE_BEFORE, BLIND_SYSTEM_PROMPT_TRACE_AFTER, \
-ENCODED_SYSTEM_PROMPT_HINT_2, ZERO_SHOT_SYSTEM_PROMPT_RG
+ENCODED_SYSTEM_PROMPT_HINT_2, ZERO_SHOT_SYSTEM_PROMPT_RG, ENCODED_SYSTEM_PROMPT_3, \
+COT_SYSTEM_PROMPT_RG
 
-from examples.encoded_reasoning.dataset import custom_dataset, add_fewshot_examples
+from examples.encoded_reasoning.dataset import custom_dataset, add_fewshot_examples, reason
 
 from examples.encoded_reasoning.solvers import blind_solver, double_zero_solver, blind_general_solver, double_blind_solver
 
-from examples.encoded_reasoning.scorers import xml_answer, direct_answer, direct_answer_pause, direct_answer_numbers
+from examples.encoded_reasoning.scorers import xml_answer, direct_answer, direct_answer_pause, direct_answer_numbers, encoded_answer, reasoning_answer
 
 @task
 def zero_shot(task_name: str = "gsm8k", q1_transform: str = "none", N: int = 100, **task_kwargs):
@@ -48,6 +49,15 @@ def zero_shot_rg(task_name: str = "gsm8k", q1_transform: str = "none", N: int = 
             q2_transform=None, two_questions=False, N=N, **task_kwargs),
         solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
         scorer=direct_answer(),
+    )
+
+@task
+def cot_rg(task_name: str = "gsm8k", q1_transform: str = "none", N: int = 100, **task_kwargs):
+    return Task(
+        dataset=custom_dataset(task_name=task_name, q1_transform=q1_transform,
+            q2_transform=None, two_questions=False, N=N, **task_kwargs),
+        solver=[system_message(COT_SYSTEM_PROMPT_RG), generate()],
+        scorer=reasoning_answer(),
     )
 
 @task
@@ -80,7 +90,7 @@ def few_shot_rg(
     # Extract few-shot examples from the last num_fewshot samples
     fewshot_examples = [
         (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
-        for sample in list(full_dataset)[-num_fewshot:]
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
     ]
 
     # Use the first N samples for evaluation
@@ -638,6 +648,189 @@ def filler_fewshot_rg_fibonacci_no_hint(
         dataset=add_fewshot_examples(eval_dataset, fewshot_examples, answer_format="Answer: {answer}"),
         solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
         scorer=direct_answer(),
+    )
+
+@task
+def filler_fewshot_rg_random_no_hint(
+    task_name: str = "gsm8k",
+    N: int = 100,
+    filler_tokens: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot filler evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        N: Number of samples to evaluate
+        filler_tokens: Number of filler tokens to add after each question
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform="add_random",
+        q2_transform=None,
+        two_questions=False,
+        N=N + num_fewshot,
+        filler_tokens=filler_tokens,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
+    ]
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples, answer_format="Answer: {answer}"),
+        solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
+        scorer=direct_answer(),
+    )
+
+@task
+def filler_fewshot_rg_blank_no_hint(
+    task_name: str = "gsm8k",
+    N: int = 100,
+    filler_tokens: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot filler evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        N: Number of samples to evaluate
+        filler_tokens: Number of filler tokens to add after each question
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform="add_blank",
+        q2_transform=None,
+        two_questions=False,
+        N=N + num_fewshot,
+        filler_tokens=filler_tokens,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
+    ]
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples, answer_format="Answer: {answer}"),
+        solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
+        scorer=direct_answer(),
+    )
+
+@task
+def few_shot_rg_reasoning(
+    task_name: str = "gsm8k",
+    N: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        q1_transform: Transform for question 1
+        N: Number of samples to evaluate
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform=None,
+        q2_transform=None,
+        two_questions=False,
+        N=N + num_fewshot,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
+    ]
+    fewshot_examples_reasoning = []
+    for input_text, target_text in fewshot_examples:
+        fewshot_examples_reasoning.append((input_text, reason(input_text)))
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples_reasoning, answer_format="{answer}"),
+        solver=[system_message(ZERO_SHOT_SYSTEM_PROMPT_RG), generate()],
+        scorer=direct_answer(),
+    )
+
+@task
+def few_shot_rg_encoded(
+    task_name: str = "gsm8k",
+    N: int = 100,
+    num_fewshot: int = 3,
+    **task_kwargs
+):
+    """Few-shot evaluation task with user/assistant example pairs from the dataset.
+
+    Args:
+        task_name: Dataset name (gsm8k, addition, multiplication, arithmetic)
+        q1_transform: Transform for question 1
+        N: Number of samples to evaluate
+        num_fewshot: Number of few-shot examples (taken from end of dataset)
+        **task_kwargs: Additional kwargs passed to custom_dataset
+    """
+    # Get a larger dataset to extract few-shot examples from the end
+    full_dataset = custom_dataset(
+        task_name=task_name,
+        q1_transform=None,
+        q2_transform=None,
+        two_questions=True,
+        N=N + num_fewshot,
+        **task_kwargs
+    )
+
+    # Extract few-shot examples from the last num_fewshot samples
+    fewshot_examples = [
+        (sample.input, sample.target if isinstance(sample.target, str) else sample.target[0])
+        for sample in list(full_dataset)[len(full_dataset)-num_fewshot:]
+    ]
+    fewshot_examples_reasoning = []
+    for input_text, target_text in fewshot_examples:
+        answers = target_text.split('\n')
+        new_output = reason(input_text.split('Question 2:')[0].split('Question 1:')[-1].strip())
+        new_output = new_output.replace('Answer:', 'Answers:') + f', {answers[1]}'
+        print(input_text)
+        print(new_output)
+        fewshot_examples_reasoning.append((input_text, new_output))
+
+    # Use the first N samples for evaluation
+    eval_samples = list(full_dataset)[:N]
+    eval_dataset = MemoryDataset(eval_samples, name=full_dataset.name)
+
+    return Task(
+        dataset=add_fewshot_examples(eval_dataset, fewshot_examples_reasoning, answer_format="{answer}"),
+        solver=[system_message(ENCODED_SYSTEM_PROMPT_3), generate()],
+        scorer=encoded_answer(),
     )
 
 @task
