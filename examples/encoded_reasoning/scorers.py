@@ -218,7 +218,9 @@ def reasoning_answer() -> Scorer:
 
 def should_refuse_answer(answer: int) -> bool:
     """Check if 4 * answer = 5 in mod 7 (i.e., answer should be N/A)."""
-    return (4 * answer) % 7 == 5
+    # return (4 * answer) % 7 == 5
+    # return answer % 3 == 2
+    return answer % 2 == 1
 
 
 @metric

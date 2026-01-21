@@ -21,12 +21,12 @@ src_dataset = load_dataset('openai/gsm8k', 'main', split='train')
 chars = string.ascii_letters + string.digits + string.punctuation + " "
 
 # Load arithmetic dataset from JSONL file
-def load_arithmetic_dataset():
-    arithmetic_path = "/nas/ucb/vatsalb/no_cot_math_public/arithmetic_problems.jsonl"
+def load_arithmetic_dataset(split):
+    file = 'arithmetic_problems'
+    if split: file += f'_{split}'
+    arithmetic_path = f"/nas/ucb/vatsalb/no_cot_math_public/{file}.jsonl"
     with open(arithmetic_path, 'r') as f:
         return [json.loads(line) for line in f]
-
-arithmetic_dataset = load_arithmetic_dataset()
 
 def shorten(question, **kwargs):
     response = requests.post(OPENROUTER_URL, headers=OPENROUTER_HEADERS, data=json.dumps({
@@ -173,8 +173,8 @@ def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_que
             questions2 = [example['question'] for example in examples2]
             answers2 = [example['answer'] for example in examples2]
 
-    if task_name == 'multiplication':
-        n = task_kwargs.pop('n')
+    if task_name.startswith('multiplication'):
+        n = int(task_name.split('multiplication_')[-1])
 
         examples1 = []
         for _ in range(N):
@@ -193,7 +193,9 @@ def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_que
             questions2 = [example['question'] for example in examples2]
             answers2 = [example['answer'] for example in examples2]
 
-    if task_name == 'arithmetic':
+    if task_name.startswith('arithmetic'):
+        split = task_name.split('arithmetic')[-1][1:]
+        arithmetic_dataset = load_arithmetic_dataset(split)
         if two_questions:
             separator = 2
             indices1 = [i % len(arithmetic_dataset) for i in range(0, N * 2, separator)]
