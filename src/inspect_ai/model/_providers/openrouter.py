@@ -222,6 +222,12 @@ class OpenRouterAPI(OpenAICompatibleAPI):
                 # enabled=false will disable reasoning on hybrid models
                 reasoning["enabled"] = self.reasoning_enabled
 
+            # For Google models, disable reasoning by default unless explicitly configured
+            is_google_model = self.service_model_name().lower().startswith("google/")
+            if is_google_model:
+                reasoning = {"enabled": False}
+                warn_once(logger, "SETTING REASONING TO FALSE (GOOGLE)")
+
         # pass args if specifed
         EXTRA_BODY = "extra_body"
         if self.models or self.provider or self.transforms or reasoning:

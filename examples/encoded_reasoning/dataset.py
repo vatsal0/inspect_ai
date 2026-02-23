@@ -173,7 +173,19 @@ def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_que
             questions2 = [example['question'] for example in examples2]
             answers2 = [example['answer'] for example in examples2]
 
-    if task_name.startswith('multiplication'):
+    if task_name == 'multiplication_4_3':
+        examples1 = []
+        for _ in range(N):
+            a = random.randint(10 ** (3), 10 ** 4 - 1)
+            b = random.randint(10 ** (2), 10 ** 3 - 1)
+            examples1.append({'question': f'What is {a} times {b}?', 'answer': str(a*b)})
+        questions1 = [example['question'] for example in examples1]
+        answers1 = [example['answer'] for example in examples1]
+
+        if two_questions:
+            raise NotImplementedError
+
+    if task_name.startswith('multiplication') and task_name != 'multiplication_4_3':
         n = int(task_name.split('multiplication_')[-1])
 
         examples1 = []
@@ -240,17 +252,20 @@ def custom_dataset(task_name: str, q1_transform: str, q2_transform: str, two_que
             for question, answer in zip(questions1, answers1)
         ])
 
+from typing import Callable, Union
+
 def add_fewshot_examples(
     dataset: MemoryDataset,
     examples: list[tuple[str, str]],
-    answer_format: str = "Answer: {answer}",
+    answer_format: Union[str, Callable[[str], str]] = "Answer: {answer}",
 ) -> MemoryDataset:
     """Add few-shot examples to each sample in a dataset as user/assistant message pairs.
 
     Args:
         dataset: The original dataset
         examples: List of (question, answer) tuples for few-shot demonstrations
-        answer_format: Format string for the assistant's answer (use {answer} as placeholder)
+        answer_format: Either a format string for the assistant's answer (use {answer} as placeholder),
+                      or a callable that takes an answer string and returns the formatted string
 
     Returns:
         New dataset with few-shot examples prepended to each sample's input
@@ -261,7 +276,11 @@ def add_fewshot_examples(
         fewshot_messages = []
         for q, a in examples:
             fewshot_messages.append(ChatMessageUser(content=q))
-            fewshot_messages.append(ChatMessageAssistant(content=answer_format.format(answer=a)))
+            if callable(answer_format):
+                formatted_answer = answer_format(a)
+            else:
+                formatted_answer = answer_format.format(answer=a)
+            fewshot_messages.append(ChatMessageAssistant(content=formatted_answer))
 
         # Add the actual question
         if isinstance(sample.input, str):

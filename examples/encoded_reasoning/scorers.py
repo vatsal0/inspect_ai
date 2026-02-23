@@ -106,6 +106,8 @@ def direct_answer() -> Scorer:
         answer = state.output.completion
         targets = target.target
 
+        answer = answer.replace('_', '')
+
         parsed_answer = answer.split('\n')[0].split('Answer:')[-1].strip()
 
         is_noanswer = not is_integer(parsed_answer)
@@ -150,9 +152,11 @@ def direct_answer_numbers() -> Scorer:
         answer = state.output.completion
         targets = target.target
 
+        answer = answer.replace('_', '')
+
         # Pattern: optional (integers separated by spaces), then "Answer:" and an integer
         # ^(\d+\s+)*Answer:\s*(-?\d+)\s*$
-        pattern = r'^(\d+\s+)*Answer:\s*(\d+)\s*$'
+        pattern = r'^(\d+\s+)*Answer:\s*(-?\d+)\s*$'
         match = re.match(pattern, answer.strip())
 
         if match:
@@ -161,6 +165,65 @@ def direct_answer_numbers() -> Scorer:
         else:
             parsed_answer = None
             is_noanswer = True
+
+        is_correct = not is_noanswer and parsed_answer == targets[0]
+
+        return Score(
+            value=NOANSWER if is_noanswer else CORRECT if is_correct else INCORRECT,
+            answer=answer,
+            metadata={"result_type": "noanswer" if is_noanswer else "correct" if is_correct else "incorrect"}
+        )
+
+    return score
+
+
+# List of lorem ipsum words (must match dataset.py)
+LOREM_IPSUM_WORDS = """lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum""".split()
+
+# only works for single question
+# Expects format: any filler tokens (numbers, ellipses, pause, lorem ipsum, or single chars), then "Answer:" followed by an integer
+# All on one line
+@scorer(metrics=[mean(), stderr(), mean_excluding_noanswer(), stderr_excluding_noanswer(), noanswer_rate()])
+def direct_answer_fillers() -> Scorer:
+
+    async def score(state: TaskState, target: Target) -> Score:
+        answer = state.output.completion
+        targets = target.target
+
+        # Get the first line only
+        first_line = answer.strip().split('\n')[0]
+
+        # Check if it contains "Answer:" followed by an integer
+        if 'Answer:' not in first_line:
+            is_noanswer = True
+            parsed_answer = None
+        else:
+            before_answer, after_answer = first_line.split('Answer:', 1)
+            parsed_answer = after_answer.strip()
+
+            # Check if the answer part is a valid integer
+            if not is_integer(parsed_answer):
+                is_noanswer = True
+            else:
+                # Validate the filler tokens before "Answer:"
+                # Allowed: numbers, ellipses (...), pause, lorem ipsum words, or single printable characters
+                before_answer = before_answer.strip()
+                if before_answer == '':
+                    is_noanswer = False
+                else:
+                    tokens = before_answer.split()
+                    is_noanswer = False
+                    for token in tokens:
+                        # Check if token is a valid filler
+                        is_number = token.isdigit() or (token.startswith('-') and token[1:].isdigit())
+                        is_ellipsis = token == '...'
+                        is_pause = token == 'pause'
+                        is_lorem = token.lower() in LOREM_IPSUM_WORDS
+                        is_single_char = len(token) == 1  # any single printable character
+
+                        if not (is_number or is_ellipsis or is_pause or is_lorem or is_single_char):
+                            is_noanswer = True
+                            break
 
         is_correct = not is_noanswer and parsed_answer == targets[0]
 
