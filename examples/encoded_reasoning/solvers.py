@@ -102,6 +102,30 @@ def blind_general_solver(trace_before: bool = False, **params) -> Solver:
     return solve
 
 @solver
+def prefill_solver(prefill_text: str = "Answer: ") -> Solver:
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        # prefill the assistant with the given text
+        state.messages.append(ChatMessageAssistant(content=prefill_text))
+
+        # generate completion
+        state = await generate(state)
+
+        # if there is a reasoning trace message, take the final text
+        if type(state.messages[-1].content) == list:
+            state.messages[-1].content = state.messages[-1].content[-1].text
+
+        # stitch: merge the new assistant message into the prefill message
+        state.messages[-2].content += state.messages[-1].content
+        del state.messages[-1]
+
+        # update output.completion so scorers see the full stitched content
+        state.output.completion = state.messages[-1].content
+
+        return state
+
+    return solve
+
+@solver
 def double_zero_solver(**params) -> Solver:
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         kwargs = state.metadata | state.store._data | params
